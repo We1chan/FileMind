@@ -2,10 +2,10 @@ import os
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import QEvent, QEventLoop, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QPushButton
 
 from filemind.config import AppPaths
 from filemind.storage import LocalStore
@@ -45,7 +45,7 @@ def test_switching_pages_and_reopening_window(app: QApplication, tmp_path: Path)
             assert heading is not None and heading.text() == title
             assert window.detail_title.text() == detail
     finally:
-        window.close()
+        close_window(window)
 
     reopened_store = LocalStore(paths.database)
     reopened = MainWindow(paths, reopened_store, reopened_store.initialize())
@@ -53,7 +53,7 @@ def test_switching_pages_and_reopening_window(app: QApplication, tmp_path: Path)
         assert reopened.navigation.currentItem().text() == "设置与任务"
         assert reopened.detail_title.text() == "任务详情"
     finally:
-        reopened.close()
+        close_window(reopened)
 
 
 def test_settings_opens_the_configured_data_directory(
@@ -80,4 +80,78 @@ def test_settings_opens_the_configured_data_directory(
         QTest.mouseClick(button, Qt.MouseButton.LeftButton)
         assert opened == [paths.root]
     finally:
-        window.close()
+        close_window(window)
+
+
+def wait_for_task(window: MainWindow) -> None:
+    if window.task is None:
+        return
+    loop = QEventLoop()
+    poll = QTimer()
+
+    def check() -> None:
+        if window.task is None:
+            loop.quit()
+
+    poll.timeout.connect(check)
+    poll.start(20)
+    timeout = QTimer()
+    timeout.setSingleShot(True)
+    timeout.timeout.connect(loop.quit)
+    timeout.start(10_000)
+    loop.exec()
+    assert window.task is None, "FileMind background task did not finish"
+
+
+def close_window(window: MainWindow) -> None:
+    window.close()
+    wait_for_task(window)
+    window.deleteLater()
+    QApplication.sendPostedEvents(window, QEvent.Type.DeferredDelete)
+
+
+def test_desktop_import_search_and_open_citation(
+    app: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "编译原理.txt"
+    source.write_text("用 FIRST/FOLLOW 构造预测分析表。", encoding="utf-8")
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileNames", staticmethod(lambda *a, **k: ([str(source)], ""))
+    )
+    paths = AppPaths.resolve(tmp_path / "app")
+    paths.prepare()
+    store = LocalStore(paths.database)
+    window = MainWindow(paths, store, store.initialize())
+    window.show()
+    app.processEvents()
+    try:
+        QTest.mouseClick(window.library_page.import_button, Qt.MouseButton.LeftButton)
+        wait_for_task(window)
+        assert window.library_page.files.count() == 1
+        assert "已索引" in window.library_page.files.item(0).text()
+        click_navigation(window, 1)
+        window.search_page.query.setText("FIRST/FOLLOW")
+        QTest.mouseClick(window.search_page.find_button, Qt.MouseButton.LeftButton)
+        wait_for_task(window)
+        assert window.search_page.results.count() == 1
+        assert "语义检索未启用" in window.search_page.note.text()
+
+        QTest.mouseClick(window.search_page.ask_button, Qt.MouseButton.LeftButton)
+        wait_for_task(window)
+        assert "原文摘录" in window.search_page.note.text()
+        citation = window.search_page.results.item(0)
+        assert citation.text().startswith("[1] 编译原理.txt")
+        result_list = window.search_page.results
+        QTest.mouseClick(
+            result_list.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=result_list.visualItemRect(citation).center(),
+        )
+        wait_for_task(window)
+        assert window.preview.isVisible()
+        assert "第 1 行" in window.detail_hint.text()
+        assert window.preview.toPlainText() == source.read_text(encoding="utf-8")
+    finally:
+        close_window(window)

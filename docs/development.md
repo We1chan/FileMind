@@ -23,6 +23,8 @@ uv run --locked pytest tests/test_window.py
 
 `uv build` 在 `dist/` 生成源码包和 Python wheel。GitHub Actions 对发往 `main` 的变更运行 Windows 检查。更新依赖时提交 `pyproject.toml` 和 `uv.lock`，并使用锁文件重新验证。
 
+本地 BGE 权重可用于完整的检索测试。用 `FILEMIND_TEST_MODEL` 指定已安装的 ONNX 文件再运行 pytest。权重的安装和评测命令见 [检索评测](evaluation.md)。
+
 ## 分支、提交与发布
 
 - `main` 是集成分支。功能用 `feat/<主题>`，修复用 `fix/<主题>`。每个提交描述一项可验证的变更。变更合入前核对需求、测试和相关文档。
