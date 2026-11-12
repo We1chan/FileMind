@@ -25,5 +25,9 @@ class AppPaths:
     def workspace(self) -> Path:
         return self.root / "workspace"
 
+    @property
+    def model(self) -> Path:
+        return self.root / "models" / "bge-small-zh-v1.5.onnx"
+
     def prepare(self) -> None:
         self.workspace.mkdir(parents=True, exist_ok=True)

@@ -40,3 +40,16 @@ def test_newer_schema_is_rejected_without_changing_data(tmp_path: Path) -> None:
     with closing(sqlite3.connect(database)) as connection:
         assert connection.execute("PRAGMA user_version").fetchone() == (newer_version,)
         assert connection.execute("SELECT content FROM saved_data").fetchall() == [("keep",)]
+
+
+def test_migrates_foundation_database_with_existing_preference(tmp_path: Path) -> None:
+    database = tmp_path / "filemind.sqlite3"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("CREATE TABLE preferences (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        connection.execute("INSERT INTO preferences VALUES ('last_page', 'search')")
+        connection.execute("PRAGMA user_version = 1")
+
+    store = LocalStore(database)
+    assert store.initialize().schema_version == SCHEMA_VERSION
+    assert store.get_preference("last_page") == "search"
+    assert store.files() == []
