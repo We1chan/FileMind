@@ -204,6 +204,12 @@ class LocalStore:
             ):
                 connection.execute("ALTER TABLE files ADD COLUMN identity TEXT")
             connection.execute("CREATE INDEX IF NOT EXISTS files_by_source ON files(source_id, id)")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS chunks_pending_embedding ON chunks(id) WHERE vector IS NULL"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS chunks_by_embedding_model ON chunks(model_fingerprint, id)"
+            )
 
             try:
                 connection.execute("CREATE VIRTUAL TABLE temp.fts5_probe USING fts5(content)")
@@ -598,17 +604,29 @@ class LocalStore:
                 )
             ]
 
-    def embedding_inputs(self, fingerprint: str, scope: SearchScope) -> list[tuple[int, str]]:
+    def embedding_inputs(
+        self, fingerprint: str, scope: SearchScope, *, limit: int = 16
+    ) -> list[tuple[int, str]]:
         clause, parameters = scope.clause()
         with self._session() as connection:
-            return [
-                (row[0], row[1][row[2] : row[3]])
-                for row in connection.execute(
-                    f"""SELECT c.id, s.text, c.start, c.end {_PASSAGES}
-                WHERE c.model_fingerprint IS NOT ? AND {clause} ORDER BY c.id LIMIT 16""",
-                    (fingerprint, *parameters),
+            pending = connection.execute(
+                f"""SELECT c.id, s.text, c.start, c.end FROM chunks c INDEXED BY chunks_pending_embedding
+                JOIN sections s ON s.id = c.section_id JOIN files f ON f.id = s.file_id
+                WHERE c.vector IS NULL AND {clause} ORDER BY c.id LIMIT ?""",
+                (*parameters, limit),
+            ).fetchall()
+            remaining = limit - len(pending)
+            if remaining:
+                pending.extend(
+                    connection.execute(
+                        f"""SELECT c.id, s.text, c.start, c.end FROM chunks c INDEXED BY chunks_by_embedding_model
+                    JOIN sections s ON s.id = c.section_id JOIN files f ON f.id = s.file_id
+                    WHERE c.model_fingerprint IS NOT NULL AND c.model_fingerprint != ?
+                      AND c.vector IS NOT NULL AND {clause} ORDER BY c.id LIMIT ?""",
+                        (fingerprint, *parameters, remaining),
+                    )
                 )
-            ]
+            return [(row[0], row[1][row[2] : row[3]]) for row in pending]
 
     def set_embeddings(self, fingerprint: str, vectors: list[tuple[bytes, int]]) -> None:
         with self._session() as connection:

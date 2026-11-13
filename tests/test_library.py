@@ -69,6 +69,39 @@ def test_binary_locations_and_ocr(library: Library, tmp_path: Path) -> None:
         assert term in passage.text
 
 
+def test_pdf_with_invalid_font_unicode_remains_searchable(library: Library, tmp_path: Path) -> None:
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    source = tmp_path / "invalid-font.pdf"
+    writer = PdfWriter()
+    page = writer.add_blank_page(300, 300)
+    cmap = DecodedStreamObject()
+    cmap.set_data(b"1 beginbfchar\n<41> <D800>\nendbfchar")
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+            NameObject("/ToUnicode"): cmap,
+        }
+    )
+    page[NameObject("/Resources")] = DictionaryObject(
+        {
+            NameObject("/Font"): DictionaryObject({NameObject("/F1"): font}),
+        }
+    )
+    stream = DecodedStreamObject()
+    stream.set_data(b"BT /F1 12 Tf 20 230 Td (A uniquePDFtext) Tj ET")
+    page.replace_contents(stream)
+    writer.write(source)
+
+    library.import_files([source])
+    passage = Search(library).find("uniquePDFtext", "keyword").hits[0].passages[0]
+    assert passage.location == "第 1 页"
+    assert passage.text == "\ufffd uniquePDFtext"
+
+
 def test_linked_refresh_checks_content_and_defers_missing_cleanup(
     library: Library,
     tmp_path: Path,
