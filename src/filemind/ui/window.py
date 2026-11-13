@@ -140,7 +140,7 @@ class MainWindow(QMainWindow):
         self.search = Search(self.library)
         self.questions = Questions(self.search)
         self.remote = RemoteSettings.from_environment()
-        self.monitor = ContinuousIndex(self.library) if monitor else None
+        self.monitor = ContinuousIndex(self.library, self.search.semantic) if monitor else None
         self.tray: QSystemTrayIcon | None = None
         self.task: Task | None = None
         self._shutdown_task: Task | None = None
@@ -489,6 +489,7 @@ class MainWindow(QMainWindow):
         if not self.isVisible() or self.task is not None or self.monitor is None:
             return
         self._reload_library()
+        self.settings_page.model_status.setText(self.search.semantic.status)
         if self.monitor.error:
             self.statusBar().showMessage(self.monitor.error, 1500)
 

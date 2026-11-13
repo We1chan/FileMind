@@ -25,6 +25,8 @@ uv run --locked pytest tests/test_window.py
 
 本地 BGE 权重可用于完整的检索测试。用 `FILEMIND_TEST_MODEL` 指定已安装的 ONNX 文件再运行 pytest。权重的安装和评测命令见 [检索评测](evaluation.md)。
 
+在 PowerShell 中设置 `$env:FILEMIND_EMBED_DEVICE = 'cpu'` 可强制在 CPU 上运行语义检索，用于对照测试。
+
 ## 分支、提交与发布
 
 - `main` 是集成分支。功能用 `feat/<主题>`，修复用 `fix/<主题>`。每个提交描述一项可验证的变更。变更合入前核对需求、测试和相关文档。

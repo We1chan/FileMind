@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -38,6 +38,7 @@ MAX_SECTIONS = 20_000
 MAX_XML_BYTES = 8 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_PAGES = 1_000
+_INVALID_UNICODE = dict.fromkeys(range(0xD800, 0xE000), "\ufffd")
 
 
 class DocumentError(ValueError):
@@ -121,7 +122,14 @@ def _collect(sections: Iterator[Section]) -> list[Section]:
         chars += len(section.text)
         if chars > MAX_TEXT_CHARS or len(result) >= MAX_SECTIONS:
             raise DocumentError("提取的文本或段落数量超过上限。")
-        result.append(section)
+        # Some PDF fonts emit unpaired UTF-16 surrogates in extracted text.
+        result.append(
+            replace(
+                section,
+                location=section.location.translate(_INVALID_UNICODE),
+                text=section.text.translate(_INVALID_UNICODE),
+            )
+        )
     return result
 
 

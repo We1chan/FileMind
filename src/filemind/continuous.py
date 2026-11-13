@@ -53,9 +53,10 @@ class _Changes(FileSystemEventHandler):
 
 
 class ContinuousIndex:
-    def __init__(self, library: Library) -> None:
+    def __init__(self, library: Library, semantic: SemanticIndex | None = None) -> None:
         self.library = library
         self.store = library.store
+        self.semantic = semantic or SemanticIndex(library.paths.model, self.store)
         self._closing = Event()
         self._paused = Event()
         if self.store.get_preference("pause_monitoring") == "1":
@@ -171,10 +172,11 @@ class ContinuousIndex:
             return trees, changes
 
     def _run(self) -> None:
-        semantic = SemanticIndex(self.library.paths.model, self.store)
+        semantic = self.semantic
         next_full = 0.0
         retry_model_at = 0.0
         while not self._closing.is_set():
+            embedding_progress = False
             try:
                 sources = self.store.sources()
                 self._sync_watches(sources)
@@ -197,10 +199,13 @@ class ContinuousIndex:
                             and semantic.path.is_file()
                         ):
                             try:
-                                for _ in range(1 if self._jobs else 2):
+                                for _ in range(1 if self._jobs else 4):
                                     if self._cancelled() or not semantic.populate_batch():
                                         break
-                                retry_model_at = monotonic() + (8 if self._jobs else 0)
+                                    embedding_progress = True
+                                retry_model_at = monotonic() + (
+                                    8 if self._jobs and not semantic.uses_gpu else 0
+                                )
                             except ModelError:
                                 retry_model_at = monotonic() + 60
                         self.error = ""
@@ -210,7 +215,8 @@ class ContinuousIndex:
                 logging.getLogger(__name__).exception("Continuous indexing failed")
                 self.error = "后台索引暂时遇到错误，将自动重试。"
                 next_full = monotonic() + 15
-            wait = WORK_SECONDS if self._jobs and not self._cancelled() else EVENT_SECONDS
+            busy = self._jobs or (embedding_progress and semantic.uses_gpu)
+            wait = WORK_SECONDS if busy and not self._cancelled() else EVENT_SECONDS
             self._wake.wait(wait)
             self._wake.clear()
 

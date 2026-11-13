@@ -40,6 +40,8 @@ uv run --locked filemind
 uv run --locked python -m filemind --install-model
 ```
 
+Windows x64 优先用 DirectML GPU 计算 BGE 向量，GPU 不可用时会回退到 CPU。「设置与任务」会显示当前推理设备。PDF、Office 和文本的解析由 CPU 执行。已有的向量在切换推理设备后可以继续使用。
+
 ### 带引用问答
 
 问答默认展示带位置的原文摘录。使用兼容 Chat Completions 的服务时，在启动前设置 `FILEMIND_LLM_URL`（完整的 HTTPS 接口地址）、`FILEMIND_LLM_MODEL` 和 `FILEMIND_LLM_API_KEY`。每次启动后，可在「设置与任务」勾选「允许远程问答」。问答只发送当前问题和限定范围内的相关摘录及引用编号。服务不可用或引用校验失败时，应用展示仍可核对的摘录。
