@@ -1,15 +1,26 @@
 """SQLite migrations, library records and versioned passages."""
 
+import json
 import sqlite3
+from collections import deque
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 
-from filemind.documents import Section, file_extension
+from filemind.documents import (
+    LEGACY_OFFICE_EXTENSIONS,
+    SHEET_EXTENSIONS,
+    WORD_EXTENSIONS,
+    Section,
+    file_extension,
+)
 from filemind.text_index import TextChunk, catalog_terms
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+OFFICE_PARSER_VERSION = 1
+RECHUNKED_EXTENSIONS = (*WORD_EXTENSIONS, *SHEET_EXTENSIONS, *LEGACY_OFFICE_EXTENSIONS)
 _LIBRARY_SCHEMA = (
     """CREATE TABLE sources (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,6 +113,7 @@ class FileRecord:
     modified_ns: int | None
     changed_ns: int | None
     identity: str | None = None
+    parser_version: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,9 +187,31 @@ class LocalStore:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
         self.fts5_available = False
+        self._change_lock = Lock()
+        self._vector_revision = 0
+        self._vector_updates: deque[tuple[int, tuple[int, ...]]] = deque(maxlen=64)
+
+    @property
+    def vector_revision(self) -> int:
+        with self._change_lock:
+            return self._vector_revision
+
+    def vector_updates_since(self, revision: int) -> tuple[int, set[int] | None]:
+        with self._change_lock:
+            current = self._vector_revision
+            if revision == current:
+                return current, set()
+            if not self._vector_updates or revision < self._vector_updates[0][0] - 1:
+                return current, None
+            return current, {
+                chunk_id
+                for committed, chunk_ids in self._vector_updates
+                if committed > revision
+                for chunk_id in chunk_ids
+            }
 
     def initialize(self) -> StorageStatus:
-        with self._session() as connection:
+        with self._session(vectors=True) as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("BEGIN IMMEDIATE")
             schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -198,6 +232,16 @@ class LocalStore:
                     "CREATE INDEX files_display_order ON files(name COLLATE NOCASE, id)"
                 )
                 connection.execute("CREATE INDEX files_by_status ON files(status)")
+            if schema_version < 4:
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS files_by_hash ON files(sha256) WHERE sha256 IS NOT NULL"
+                )
+                connection.execute(
+                    "ALTER TABLE files ADD COLUMN parser_version INTEGER NOT NULL DEFAULT 0"
+                )
+                connection.execute(
+                    "ALTER TABLE sections ADD COLUMN heading TEXT NOT NULL DEFAULT ''"
+                )
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             if not any(
                 row[1] == "identity" for row in connection.execute("PRAGMA table_info(files)")
@@ -304,7 +348,7 @@ class LocalStore:
             )
 
     def remove_source(self, source_id: int) -> None:
-        with self._session() as connection:
+        with self._session(vectors=True) as connection:
             if self.fts5_available:
                 connection.execute(
                     "DELETE FROM file_catalog WHERE rowid IN (SELECT id FROM files WHERE source_id = ?)",
@@ -320,6 +364,28 @@ class LocalStore:
             else:
                 connection.execute("INSERT OR IGNORE INTO preferences VALUES ('fts5_dirty', '1')")
             connection.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+
+    def remove_linked_files(self, file_ids: list[int]) -> None:
+        if not file_ids:
+            return
+        with self._session(vectors=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("CREATE TEMP TABLE excluded_files (id INTEGER PRIMARY KEY)")
+            connection.executemany(
+                "INSERT INTO excluded_files SELECT id FROM files WHERE id = ? AND source_id IS NOT NULL",
+                ((file_id,) for file_id in file_ids),
+            )
+            if self.fts5_available:
+                connection.execute("DELETE FROM file_catalog WHERE rowid IN excluded_files")
+                connection.execute(
+                    """DELETE FROM chunk_fts WHERE rowid IN (
+                        SELECT c.id FROM sections s JOIN chunks c ON c.section_id = s.id
+                        WHERE s.file_id IN excluded_files
+                    )"""
+                )
+            else:
+                connection.execute("INSERT OR IGNORE INTO preferences VALUES ('fts5_dirty', '1')")
+            connection.execute("DELETE FROM files WHERE id IN excluded_files")
 
     def files(
         self, *, limit: int = -1, offset: int = 0, name: str = "", status: str | None = None
@@ -396,6 +462,25 @@ class LocalStore:
                 result.update((row["id"], _file(row)) for row in rows)
         return result
 
+    def copy_counts(self, hashes: set[str], scope: SearchScope, *, catalog: bool) -> dict[str, int]:
+        if not hashes:
+            return {}
+        clause, parameters = scope.clause(catalog=catalog)
+        counts = {}
+        ordered = sorted(hashes)
+        with self._session() as connection:
+            for start in range(0, len(ordered), 500):
+                batch = ordered[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                counts.update(
+                    connection.execute(
+                        f"""SELECT f.sha256, count(*) FROM files f
+                        WHERE f.sha256 IN ({placeholders}) AND {clause} GROUP BY f.sha256""",
+                        (*batch, *parameters),
+                    )
+                )
+        return counts
+
     def register_file(
         self, source_id: int | None, relative: Path, key: str, *, import_from: Path | None = None
     ) -> int:
@@ -450,7 +535,7 @@ class LocalStore:
             )
 
     def unavailable(self, file_id: int, status: str, reason: str) -> None:
-        with self._session() as connection:
+        with self._session(vectors=True) as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._delete_sections(connection, file_id)
             connection.execute(
@@ -467,16 +552,23 @@ class LocalStore:
             )
 
     def begin_index(
-        self, file_id: int, sha256: str | None, fingerprint: tuple[int, int, int, str]
+        self,
+        file_id: int,
+        sha256: str | None,
+        fingerprint: tuple[int, int, int, str],
+        *,
+        parser_version: int = 0,
     ) -> int:
-        with self._session() as connection:
+        with self._session(vectors=True) as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._delete_sections(connection, file_id)
             return connection.execute(
-                """UPDATE files SET version = version + (sha256 IS NOT ? OR ? IS NULL), sha256 = ?,
-                size = ?, modified_ns = ?, changed_ns = ?, identity = ?, status = 'pending', reason = ''
+                """UPDATE files SET
+                version = version + (sha256 IS NOT ? OR ? IS NULL OR parser_version != ?),
+                sha256 = ?, parser_version = ?, size = ?, modified_ns = ?, changed_ns = ?,
+                identity = ?, status = 'pending', reason = ''
                 WHERE id = ? RETURNING version""",
-                (sha256, sha256, sha256, *fingerprint, file_id),
+                (sha256, sha256, parser_version, sha256, parser_version, *fingerprint, file_id),
             ).fetchone()[0]
 
     def finish_index(
@@ -497,8 +589,8 @@ class LocalStore:
                 return
             for section, chunks in sections:
                 section_id = connection.execute(
-                    "INSERT INTO sections(file_id, location, text) VALUES (?, ?, ?)",
-                    (file_id, section.location, section.text),
+                    "INSERT INTO sections(file_id, location, text, heading) VALUES (?, ?, ?, ?)",
+                    (file_id, section.location, section.text, section.heading),
                 ).lastrowid
                 for chunk in chunks:
                     chunk_id = connection.execute(
@@ -561,17 +653,27 @@ class LocalStore:
             return {row["chunk_id"]: _passage(row) for row in rows}
 
     def keyword_ranks(
-        self, query: str, scope: SearchScope, budget: int = 6000
+        self,
+        query: str,
+        scope: SearchScope,
+        budget: int = 6000,
+        *,
+        terms: tuple[str, ...] = (),
     ) -> list[tuple[int, int]]:
         if not self.fts5_available or not query:
             return []
         clause, parameters = scope.clause()
+        if terms:
+            fields = "' ' || c.name_terms || ' ' || c.body_terms || ' '"
+            coverage = " + ".join(f"(instr({fields}, ?) > 0)" for _ in terms)
+            clause += f" AND ({coverage}) >= 2"
+            parameters.extend(f" {term} " for term in terms)
         with self._session() as connection:
             return [
                 tuple(row)
                 for row in connection.execute(
                     f"""SELECT f.id, c.id {_PASSAGES} JOIN chunk_fts ON chunk_fts.rowid = c.id
-                WHERE chunk_fts MATCH ? AND {clause} ORDER BY bm25(chunk_fts, 1.8, 1.0), c.id LIMIT ?""",
+                WHERE chunk_fts MATCH ? AND {clause} ORDER BY bm25(chunk_fts, 3.0, 1.0), c.id LIMIT ?""",
                     (query, *parameters, budget),
                 )
             ]
@@ -610,7 +712,8 @@ class LocalStore:
         clause, parameters = scope.clause()
         with self._session() as connection:
             pending = connection.execute(
-                f"""SELECT c.id, s.text, c.start, c.end FROM chunks c INDEXED BY chunks_pending_embedding
+                f"""SELECT c.id, s.text, c.start, c.end, f.name, f.parser_version, s.heading
+                FROM chunks c INDEXED BY chunks_pending_embedding
                 JOIN sections s ON s.id = c.section_id JOIN files f ON f.id = s.file_id
                 WHERE c.vector IS NULL AND {clause} ORDER BY c.id LIMIT ?""",
                 (*parameters, limit),
@@ -619,35 +722,91 @@ class LocalStore:
             if remaining:
                 pending.extend(
                     connection.execute(
-                        f"""SELECT c.id, s.text, c.start, c.end FROM chunks c INDEXED BY chunks_by_embedding_model
+                        f"""SELECT c.id, s.text, c.start, c.end, f.name, f.parser_version, s.heading
+                        FROM chunks c INDEXED BY chunks_by_embedding_model
                     JOIN sections s ON s.id = c.section_id JOIN files f ON f.id = s.file_id
                     WHERE c.model_fingerprint IS NOT NULL AND c.model_fingerprint != ?
                       AND c.vector IS NOT NULL AND {clause} ORDER BY c.id LIMIT ?""",
                         (fingerprint, *parameters, remaining),
                     )
                 )
-            return [(row[0], row[1][row[2] : row[3]]) for row in pending]
+            return [
+                (
+                    chunk_id,
+                    (
+                        "\n".join(filter(None, (name[:100], heading[:100]))) + "\n"
+                        if parser_version
+                        else ""
+                    )
+                    + text[start:end],
+                )
+                for chunk_id, text, start, end, name, parser_version, heading in pending
+            ]
 
     def set_embeddings(self, fingerprint: str, vectors: list[tuple[bytes, int]]) -> None:
-        with self._session() as connection:
+        with self._session(
+            vectors=True, updated_chunks=tuple(row[1] for row in vectors)
+        ) as connection:
             connection.executemany(
                 "UPDATE chunks SET model_fingerprint = ?, vector = ? WHERE id = ?",
                 ((fingerprint, vector, chunk_id) for vector, chunk_id in vectors),
             )
 
-    def embeddings(self, fingerprint: str, scope: SearchScope) -> Iterator[tuple[int, int, bytes]]:
+    def reusable_vectors(self, fingerprint: str, chunk_ids: list[int]) -> dict[int, bytes]:
+        if not chunk_ids:
+            return {}
+        placeholders = ",".join("?" for _ in chunk_ids)
+        with self._session() as connection:
+            rows = connection.execute(
+                f"""SELECT p.id, (
+                    SELECT c.vector
+                    FROM files d INDEXED BY files_by_hash
+                    JOIN sections s INDEXED BY sections_file ON s.file_id = d.id
+                    JOIN chunks c INDEXED BY chunks_section ON c.section_id = s.id
+                    WHERE d.sha256 IS NOT NULL AND d.sha256 = f.sha256 AND d.id != f.id
+                      AND d.extension = f.extension AND d.parser_version = f.parser_version
+                      AND (f.parser_version = 0 OR d.name = f.name)
+                      AND s.location = original.location AND s.heading = original.heading
+                      AND s.text = original.text AND c.start = p.start AND c.end = p.end
+                      AND c.model_fingerprint = ? AND c.vector IS NOT NULL
+                    LIMIT 1
+                ) FROM chunks p JOIN sections original ON original.id = p.section_id
+                JOIN files f ON f.id = original.file_id
+                WHERE p.id IN ({placeholders}) AND f.sha256 IS NOT NULL""",
+                (fingerprint, *chunk_ids),
+            )
+            return {chunk_id: vector for chunk_id, vector in rows if vector is not None}
+
+    def embeddings(
+        self, fingerprint: str, scope: SearchScope, *, chunk_ids: list[int] | None = None
+    ) -> Iterator[tuple[int, int, bytes]]:
         clause, parameters = scope.clause()
+        if chunk_ids is not None:
+            clause += " AND c.id IN (SELECT value FROM json_each(?))"
+            parameters.append(json.dumps(chunk_ids))
         with self._session() as connection:
             rows = connection.execute(
                 f"""SELECT f.id, c.id, c.vector {_PASSAGES}
-                WHERE c.model_fingerprint = ? AND {clause} ORDER BY c.id""",
+                WHERE c.model_fingerprint = ? AND c.vector IS NOT NULL AND {clause} ORDER BY c.id""",
                 (fingerprint, *parameters),
             )
             yield from map(tuple, rows)
 
     @contextmanager
-    def _session(self) -> Iterator[sqlite3.Connection]:
-        with closing(sqlite3.connect(self.database_path, timeout=3.0)) as connection, connection:
+    def _session(
+        self, *, vectors: bool = False, updated_chunks: tuple[int, ...] = ()
+    ) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self.database_path, timeout=3.0)) as connection:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
-            yield connection
+            connection.execute("PRAGMA temp_store = MEMORY")
+            with connection:
+                yield connection
+                if vectors and connection.total_changes:
+                    with self._change_lock:
+                        connection.commit()
+                        self._vector_revision += 1
+                        if updated_chunks:
+                            self._vector_updates.append((self._vector_revision, updated_chunks))
+                        else:
+                            self._vector_updates.clear()

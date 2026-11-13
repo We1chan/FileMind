@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from filemind.config import AppPaths
+from filemind.config import AppPaths, checkout_data_dir
 from filemind.embeddings import MODEL_ID, MODEL_SHA256
 from filemind.library import Library
 from filemind.search import Search, SearchMode
@@ -74,7 +74,9 @@ def main() -> None:
         "model": {"id": MODEL_ID, "sha256": MODEL_SHA256} if args.model.is_file() else None,
         "modes": {},
     }
-    with tempfile.TemporaryDirectory(prefix="filemind-eval-") as directory:
+    temporary = checkout_data_dir() / "tmp"
+    temporary.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="filemind-eval-", dir=temporary) as directory:
         root = Path(directory)
         inputs = root / "corpus"
         inputs.mkdir()
@@ -86,6 +88,7 @@ def main() -> None:
         store = LocalStore(paths.database)
         store.initialize()
         library = Library(paths, store)
+        library.project_data = None  # Only this isolated evaluator reads its generated corpus.
         files = []
         for name, title, paragraphs in documents:
             file = inputs / name

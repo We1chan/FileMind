@@ -69,6 +69,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"本地 BGE 权重已就绪：{paths.model}")
         return 0
 
+    try:
+        paths = AppPaths.resolve(args.data_dir)
+        paths.use_local_temp()
+        paths.prepare()
+    except OSError:
+        return report_startup_error(None, "无法创建数据目录。请检查路径和写入权限。")
+
     app = None
     if not args.check and not args.add_common_locations:
         app = QApplication([])
@@ -80,8 +87,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         app.setFont(font)
 
     try:
-        paths = AppPaths.resolve(args.data_dir)
-        paths.prepare()
         channel = (
             "filemind-"
             + hashlib.sha256(str(paths.root).casefold().encode("utf-8")).hexdigest()[:24]
@@ -125,7 +130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             store,
             status,
             monitor=True,
-            startup_allowed=args.data_dir is None and sys.platform == "win32",
+            startup_allowed=paths.root == AppPaths.resolve().root and sys.platform == "win32",
         )
     except UnsupportedSchemaError as error:
         return report_startup_error(app, str(error))

@@ -61,7 +61,7 @@ def test_binary_locations_and_ocr(library: Library, tmp_path: Path) -> None:
         "PageUniqueWord": "第 2 页",
         "HeadingUniqueWord": "第 1 段（标题）",
         "ParagraphUniqueWord": "第 2 段",
-        "TableUniqueWord": "表 1 · 第 1 行第 2 列 · 第 1 段",
+        "TableUniqueWord": "表 1 · 第 1 行",
         "SlideUniqueWord": "第 2 张幻灯片",
     }.items():
         passage = search.find(term, "keyword").hits[0].passages[0]
@@ -148,6 +148,81 @@ def test_linked_refresh_checks_content_and_defers_missing_cleanup(
     assert not library.store.files()
     assert note.read_text(encoding="utf-8") == "restored linked note"
     assert private.read_text(encoding="utf-8") == "private"
+
+
+def test_linked_exclusions_prune_existing_records_and_keep_shared_documents(
+    library: Library, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from filemind import library as library_module
+
+    root = tmp_path / "Drive"
+    cache = root / "Tool" / "CACHE"
+    shared = root / "ProgramFiles" / "WeChat" / "xwechat_files" / "msg" / "file"
+    unwanted = root / "custom"
+    for directory in (cache, shared, unwanted):
+        directory.mkdir(parents=True)
+    generated = cache / "generated.txt"
+    license_file = root / "LICENSE.txt"
+    user_file = unwanted / "sample.txt"
+    lecture = shared / "lecture.txt"
+    for file in (generated, license_file, user_file, lecture):
+        file.write_text(f"indexseed {file.stem}", encoding="utf-8")
+    with monkeypatch.context() as patched:
+        patched.setattr(library_module, "_noise_path", lambda *_: False)
+        source_id = library.link_directory(root)
+    ids = {file.name: file.id for file in library.store.files()}
+    assert set(ids) == {file.name for file in (generated, license_file, user_file, lecture)}
+
+    library.set_excluded_directories([unwanted])
+    reopened = Library(library.paths, library.store)
+    assert reopened.excluded_directories == (unwanted,)
+    with monkeypatch.context() as patched:
+        discover = reopened._discover
+
+        def warn(*args):
+            found, _ = discover(*args)
+            return found, "部分文件或子目录无法访问。"
+
+        patched.setattr(reopened, "_discover", warn)
+        reopened.refresh()
+    assert [file.name for file in library.store.files()] == [lecture.name]
+    assert [hit.file.id for hit in Search(reopened).find("indexseed", "keyword").hits] == [
+        ids[lecture.name]
+    ]
+    assert all(file.is_file() for file in (generated, license_file, user_file, lecture))
+    reopened.set_excluded_directories([])
+    reopened.refresh()
+    assert {file.name for file in library.store.source_files(source_id).values()} == {
+        lecture.name,
+        user_file.name,
+    }
+
+
+def test_search_folds_identical_content_within_scope_and_keeps_a_current_preview(
+    library: Library, tmp_path: Path
+) -> None:
+    notes = tmp_path / "source"
+    notes.mkdir()
+    first, second = notes / "copy-a.txt", notes / "copy-b.txt"
+    for path in (first, second):
+        path.write_text("uniqueDuplicateNeedle", encoding="utf-8")
+    library.link_directory(notes)
+    search = Search(library)
+    hits = search.find("uniqueDuplicateNeedle", "keyword").hits
+    assert len(hits) == 1 and hits[0].copies == 2
+    names = search.find("copy-", "filename").hits
+    assert len(names) == 1 and names[0].copies == 2
+    records = {file.name: file for file in library.store.files()}
+    second_id = records[second.name].id
+    scoped = search.find(
+        "uniqueDuplicateNeedle", "keyword", SearchScope(file_ids=(second_id,))
+    ).hits[0]
+    assert scoped.file.id == second_id and scoped.copies == 1
+    first.unlink()
+    current = search.find("uniqueDuplicateNeedle", "keyword").hits[0]
+    assert current.file.id == second_id
+    passage = current.passages[0]
+    assert library.preview(passage.chunk_id, current.file.version).text == "uniqueDuplicateNeedle"
 
 
 def test_retries_a_failed_parse_and_uses_actual_wordpiece_boundaries(

@@ -10,7 +10,7 @@ import pytest
 from xlsxwriter import Workbook
 
 from filemind.continuous import ContinuousIndex
-from filemind.embeddings import DIMENSIONS, FINGERPRINT
+from filemind.embeddings import DIMENSIONS, FINGERPRINT, SemanticIndex
 from filemind.library import Library
 from filemind.qa import Questions
 from filemind.search import Search
@@ -51,10 +51,9 @@ def test_catalog_scans_past_the_old_limit_and_retains_large_files(
     assert [hit.file.name for hit in search.find("workspace Installer", "keyword").hits] == [
         target.name
     ]
-    assert {hit.file.name for hit in search.find("FileMindMarkdownNeedle", "keyword").hits} == {
-        note.name,
-        hardlink.name,
-    }
+    hits = search.find("FileMindMarkdownNeedle", "keyword").hits
+    assert len(hits) == 1 and hits[0].copies == 2
+    assert hits[0].file.name in {note.name, hardlink.name}
     assert not search.find("ExcludedNeedle", "keyword").hits
     assert library.store.counts() == (3, 3)
     assert not Questions(search).ask("Installer.exe", "keyword").citations
@@ -193,3 +192,42 @@ def test_embeddings_are_committed_during_a_directory_scan(
     finally:
         release_scan.set()
         service.stop()
+
+
+def test_copy_reuses_vector_and_refreshes_cached_search(
+    library: Library, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    generated = []
+
+    class Model:
+        uses_gpu = True
+
+        def embed(self, texts: list[str]) -> np.ndarray:
+            generated.extend(texts)
+            return np.full((len(texts), DIMENSIONS), DIMENSIONS**-0.5, dtype="<f4")
+
+    model = library.paths.model
+    model.parent.mkdir()
+    model.touch()
+    monkeypatch.setattr("filemind.embeddings.BgeModel", lambda _: Model())
+    semantic = SemanticIndex(model, library.store)
+    scope = SearchScope(content_only=True)
+    first, second = tmp_path / "source-a.txt", tmp_path / "source-b.txt"
+    text = "ReusableCopyNeedle"
+    first.write_text(text, encoding="utf-8")
+    second.write_text(text, encoding="utf-8")
+
+    library.import_files([first, second])
+    records = library.store.files()
+    assert semantic.populate_batch(SearchScope(file_ids=(records[0].id,)))
+    assert len(semantic.rank("needle", scope, lambda: False, populate=False)) == 1
+    revision = library.store.vector_revision
+    assert semantic.populate_batch()
+    stored = list(library.store.embeddings(FINGERPRINT, scope))
+    appended = next(chunk_id for file_id, chunk_id, _ in stored if file_id == records[1].id)
+    assert library.store.vector_updates_since(revision)[1] == {appended}
+    assert len(semantic.rank("needle", scope, lambda: False, populate=False)) == 2
+    assert generated.count(text) == 1
+
+    library.store.set_embeddings(FINGERPRINT, [(stored[0][2], stored[0][1])])
+    assert len(semantic.rank("needle", scope, lambda: False, populate=False)) == 2

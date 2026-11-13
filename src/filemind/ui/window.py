@@ -14,6 +14,8 @@ from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -46,6 +48,7 @@ from filemind.ui.pages import (
     LibraryPage,
     SearchPage,
     SettingsPage,
+    button,
     file_origin,
     label,
 )
@@ -385,12 +388,84 @@ class MainWindow(QMainWindow):
 
         settings = self.settings_page
         settings.open_button.clicked.connect(self._open_data_dir)
+        settings.exclusions_button.clicked.connect(self._edit_exclusions)
         settings.tasks.currentItemChanged.connect(self._task_detail)
         settings.retry_button.clicked.connect(lambda: self._retry(settings.selected_task()))
         settings.unlink_button.clicked.connect(self._unlink_directory)
         settings.startup.toggled.connect(self._toggle_startup)
         if self.monitor is not None:
             settings.pause.toggled.connect(self.monitor.pause)
+
+    def _edit_exclusions(self) -> None:
+        sources = [Path(source.path) for source in self.store.sources()]
+        if not sources:
+            self.statusBar().showMessage("关联目录后即可设置排除目录。", 5000)
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("管理排除目录")
+        dialog.resize(600, 360)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(label("选择已关联来源下无需索引的目录。", "Hint"))
+        entries = QListWidget()
+        entries.setAccessibleName("排除目录")
+        entries.addItems(list(map(str, self.library.excluded_directories)))
+        layout.addWidget(entries)
+        add = button("添加目录")
+        remove = button("移除所选")
+        actions = QHBoxLayout()
+        actions.addWidget(add)
+        actions.addWidget(remove)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        def choose() -> None:
+            directory = QFileDialog.getExistingDirectory(
+                dialog,
+                "选择要排除的目录",
+                str(sources[0]),
+                QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks,
+            )
+            if not directory:
+                return
+            path = Path(os.path.abspath(directory))
+            if not any(path.is_relative_to(source) for source in sources):
+                QMessageBox.warning(dialog, "无法排除目录", "请选择已关联来源下的目录。")
+                return
+            if all(Path(entries.item(i).text()) != path for i in range(entries.count())):
+                entries.addItem(str(path))
+
+        add.clicked.connect(choose)
+        remove.clicked.connect(lambda: entries.takeItem(entries.currentRow()))
+        remove.setEnabled(False)
+        entries.currentRowChanged.connect(lambda row: remove.setEnabled(row >= 0))
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        directories = [Path(entries.item(i).text()) for i in range(entries.count())]
+
+        def apply(stop: Callable[[], bool]) -> None:
+            self.library.set_excluded_directories(directories)
+            if self.monitor is None:
+                self.library.refresh(stop)
+            else:
+                for source in self.store.sources():
+                    if stop():
+                        break
+                    self.library.prune_excluded(source)
+
+        self._start("正在更新排除目录…", apply, self._exclusions_changed, writes=True)
+
+    def _exclusions_changed(self, _result: object) -> None:
+        self._after_index()
+        if self.monitor is not None:
+            self.monitor.refresh()
 
     def _start(
         self,

@@ -7,6 +7,8 @@ import os
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import closing
+from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from threading import Lock
 from urllib.request import urlopen
@@ -26,6 +28,10 @@ MODEL_SHA256 = "69a0b846f4f116b5e6aabf9546ea6754d02264f3211a13a1bd69b31b8040749a
 MODEL_BYTES = 94_851_877
 FINGERPRINT = f"{MODEL_ID}:{MODEL_SHA256}:cls-f32-v1"
 DIMENSIONS = 512
+RANK_BATCH = 2048
+RANK_LIMIT = 3000
+VECTOR_CACHE_BYTES = 640 * 1024 * 1024
+MIN_COSINE = 0.53
 CPU_PROVIDER = "CPUExecutionProvider"
 GPU_PROVIDER = "DmlExecutionProvider"
 _QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
@@ -34,6 +40,13 @@ _DISABLED = "语义检索未启用"
 
 class ModelError(RuntimeError):
     """Local weights or inference could not be used."""
+
+
+@dataclass(frozen=True, slots=True)
+class _VectorBlock:
+    files: tuple[int, ...]
+    chunks: tuple[int, ...]
+    matrix: NDArray[np.float32]
 
 
 def install_model(destination: Path) -> None:
@@ -152,6 +165,10 @@ class SemanticIndex:
         self.signature: tuple[int, int, int] | None = None
         self.error = ""
         self._load_lock = Lock()
+        self._vector_lock = Lock()
+        self._vector_key: tuple[int, SearchScope] | None = None
+        self._vectors: list[_VectorBlock] = []
+        self._chunk_ids: set[int] = set()
 
     @property
     def status(self) -> str:
@@ -213,15 +230,90 @@ class SemanticIndex:
         target = self._embed(model, [_QUERY_PREFIX + query])[0]
 
         def scores() -> Iterator[tuple[float, int, int]]:
-            with closing(self.store.embeddings(FINGERPRINT, scope)) as rows:
-                for file_id, chunk_id, encoded in rows:
+            with closing(self._vector_blocks(scope, cancelled)) as blocks:
+                for block in blocks:
+                    similarities = np.einsum("ij,j->i", block.matrix, target)
+                    selected = np.flatnonzero(similarities >= MIN_COSINE)
+                    yield from zip(
+                        map(float, -similarities[selected]),
+                        (block.chunks[i] for i in selected),
+                        (block.files[i] for i in selected),
+                        strict=True,
+                    )
+
+        with closing(scores()) as rows:
+            best = heapq.nsmallest(RANK_LIMIT, rows)
+        self.error = ""
+        return [] if cancelled() else [(file_id, chunk_id) for _, chunk_id, file_id in best]
+
+    def _vector_blocks(
+        self, scope: SearchScope, cancelled: Callable[[], bool]
+    ) -> Iterator[_VectorBlock]:
+        with self._vector_lock:
+            key = (self.store.vector_revision, scope)
+            if (
+                self._vector_key is not None
+                and self._vector_key[1] == scope
+                and self._vector_key != key
+            ):
+                revision, updates = self.store.vector_updates_since(self._vector_key[0])
+                if updates is not None and updates.isdisjoint(self._chunk_ids):
+                    with closing(
+                        self._read_vector_blocks(scope, cancelled, chunk_ids=sorted(updates))
+                    ) as rows:
+                        blocks = list(rows) if updates else []
                     if cancelled():
                         return
-                    vector = np.frombuffer(encoded, dtype="<f4", count=DIMENSIONS)
-                    yield -float(np.dot(target, vector)), chunk_id, file_id
+                    total = sum(block.matrix.nbytes for block in (*self._vectors, *blocks))
+                    if total <= VECTOR_CACHE_BYTES and self.store.vector_revision == revision:
+                        self._vectors.extend(blocks)
+                        self._chunk_ids.update(
+                            chunk_id for block in blocks for chunk_id in block.chunks
+                        )
+                        self._vector_key = (revision, scope)
+                        key = self._vector_key
+            if self._vector_key == key:
+                for block in self._vectors:
+                    if cancelled():
+                        return
+                    yield block
+                return
+            self._vector_key = None
+            self._vectors.clear()
+            self._chunk_ids.clear()
+            total = 0
+            with closing(self._read_vector_blocks(scope, cancelled)) as blocks:
+                for block in blocks:
+                    total += block.matrix.nbytes
+                    if total <= VECTOR_CACHE_BYTES:
+                        self._vectors.append(block)
+                    elif self._vectors:
+                        self._vectors.clear()
+                    yield block
+            if (
+                not cancelled()
+                and self.store.vector_revision == key[0]
+                and total <= VECTOR_CACHE_BYTES
+            ):
+                self._vector_key = key
+                self._chunk_ids.update(
+                    chunk_id for block in self._vectors for chunk_id in block.chunks
+                )
+            else:
+                self._vectors.clear()
 
-        self.error = ""
-        return [(file_id, chunk_id) for _, chunk_id, file_id in heapq.nsmallest(3000, scores())]
+    def _read_vector_blocks(
+        self,
+        scope: SearchScope,
+        cancelled: Callable[[], bool],
+        *,
+        chunk_ids: list[int] | None = None,
+    ) -> Iterator[_VectorBlock]:
+        with closing(self.store.embeddings(FINGERPRINT, scope, chunk_ids=chunk_ids)) as rows:
+            while not cancelled() and (batch := list(islice(rows, RANK_BATCH))):
+                files, chunks, vectors = zip(*batch, strict=True)
+                matrix = np.frombuffer(b"".join(vectors), dtype="<f4").reshape(-1, DIMENSIONS)
+                yield _VectorBlock(files, chunks, matrix)
 
     def populate_batch(
         self,
@@ -235,16 +327,18 @@ class SemanticIndex:
         model = self._load()
         batch_size = 32 if model.uses_gpu else 16
         pending = self.store.embedding_inputs(FINGERPRINT, scope, limit=batch_size * batches)
+        reusable = self.store.reusable_vectors(FINGERPRINT, [chunk_id for chunk_id, _ in pending])
+        computed = {text: reusable[chunk_id] for chunk_id, text in pending if chunk_id in reusable}
         encoded = []
         for start in range(0, len(pending), batch_size):
             if cancelled is not None and cancelled():
                 break
             batch = pending[start : start + batch_size]
-            vectors = self._embed(model, [text for _, text in batch])
-            encoded.extend(
-                (vector.tobytes(), chunk_id)
-                for (chunk_id, _), vector in zip(batch, vectors, strict=True)
-            )
+            missing = list(dict.fromkeys(text for _, text in batch if text not in computed))
+            if missing:
+                vectors = self._embed(model, missing)
+                computed.update(zip(missing, (vector.tobytes() for vector in vectors), strict=True))
+            encoded.extend((computed[text], chunk_id) for chunk_id, text in batch)
         if encoded:
             self.store.set_embeddings(FINGERPRINT, encoded)
         return bool(encoded)

@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from uuid import UUID
 
+from filemind.config import AppPaths
+
 _RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _VALUE = "FileMind"
 
@@ -52,7 +54,19 @@ def startup_command() -> str:
     interpreter = Path(sys.executable).with_name("pythonw.exe")
     if not interpreter.is_file():
         raise OSError("找不到 FileMind 的后台 Python 入口。")
-    return subprocess.list2cmdline([str(interpreter), "-m", "filemind", "--tray"])
+    paths = AppPaths.resolve()
+    return subprocess.list2cmdline(
+        [
+            str(interpreter),
+            "-X",
+            f"pycache_prefix={paths.bytecode}",
+            "-m",
+            "filemind",
+            "--tray",
+            "--data-dir",
+            str(paths.root),
+        ]
+    )
 
 
 def starts_with_windows() -> bool:

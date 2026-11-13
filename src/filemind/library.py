@@ -1,6 +1,7 @@
 """Managed copies, read-only source scans and repeatable indexing."""
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -9,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from filemind.config import AppPaths
+from filemind.config import AppPaths, checkout_data_dir, installed_data_dir
 from filemind.documents import (
     EXTENSIONS,
     MAX_FILE_BYTES,
@@ -19,17 +20,38 @@ from filemind.documents import (
     parse_document,
 )
 from filemind.file_metadata import file_metadata
-from filemind.storage import FileRecord, LocalStore, Passage, Source
+from filemind.storage import (
+    OFFICE_PARSER_VERSION,
+    RECHUNKED_EXTENSIONS,
+    FileRecord,
+    LocalStore,
+    Passage,
+    Source,
+)
 from filemind.text_index import keyword_terms, split_section
 
 DISCOVERY_BATCH = 256
 _SKIPPED_DIRECTORIES = {
     "node_modules",
+    "program files",
+    "program files (x86)",
     "__pycache__",
     "$recycle.bin",
     "system volume information",
     "windowsapps",
 }
+_NOISE_DIRECTORIES = {
+    "_build",
+    "appcaches",
+    "build",
+    "cache",
+    "caches",
+    "site-packages",
+    "temp",
+    "tmp",
+}
+_NOISE_FILE = re.compile(r"^(?:cmakelists\.txt|(?:copying|license|licence)(?:\.[a-z0-9]+)?)$")
+_EXCLUSIONS = "excluded_directories"
 _SENSITIVE = re.compile(
     r"(?:^|[ ._-])(?:secrets?|credentials?|passwords?|passwd|private[ _-]?keys?|"
     r"(?:api[ _-]?keys?|access[ _-]?tokens?)|id_rsa|id_ed25519|kubeconfig)(?:$|[ ._-])",
@@ -62,6 +84,16 @@ def _excluded_name(name: str) -> bool:
         or Path(name).stem.lower() in {"config", "settings", "configuration"}
         or bool(_SENSITIVE.search(name))
     )
+
+
+def _noise_path(parts: tuple[str, ...], directory: bool) -> bool:
+    folders = parts if directory else parts[:-1]
+    return any(
+        part in _NOISE_DIRECTORIES
+        or part.startswith("cmake-build-")
+        or part.endswith((".dist-info", ".egg-info"))
+        for part in folders
+    ) or bool(parts and not directory and _NOISE_FILE.fullmatch(parts[-1]))
 
 
 def _is_link(info: os.stat_result) -> bool:
@@ -139,24 +171,69 @@ class Library:
     def __init__(self, paths: AppPaths, store: LocalStore) -> None:
         self.paths = paths
         self.store = store
-        self.excluded_roots = (paths.root, AppPaths.resolve().root)
-        project = Path(__file__).resolve().parents[2]
-        if (project / "pyproject.toml").is_file() and (project / "src" / "filemind").is_dir():
-            self.excluded_roots += (project / "data",)
+        self.excluded_roots = (paths.root, AppPaths.resolve().root, installed_data_dir().resolve())
+        self.project_data = checkout_data_dir()
         if os.name == "nt":
             self.excluded_roots += (Path(os.environ.get("SystemRoot", r"C:\Windows")),)
-
-    def excluded(self, path: Path, root: Path | None = None) -> bool:
-        parts = path.relative_to(root).parts if root is not None else path.parts[1:]
-        return any(path.is_relative_to(item) for item in self.excluded_roots) or any(
-            _excluded_name(part) for part in parts
+        self.excluded_directories = tuple(
+            map(Path, json.loads(store.get_preference(_EXCLUSIONS) or "[]"))
         )
 
-    def _external(self, path: Path) -> tuple[Path, os.stat_result]:
+    def excluded(
+        self,
+        path: Path,
+        source_root: Path | None = None,
+        *,
+        directory: bool = False,
+    ) -> bool:
+        parts = path.parts[1:]
+        if self.project_data is not None and path.is_relative_to(self.project_data):
+            return True
+        if any(path.is_relative_to(root) for root in self.excluded_roots) or any(
+            _excluded_name(part) for part in parts
+        ):
+            return True
+        if source_root is None:
+            return False
+        return _noise_path(
+            tuple(part.casefold() for part in path.relative_to(source_root).parts), directory
+        ) or any(path.is_relative_to(excluded) for excluded in self.excluded_directories)
+
+    def set_excluded_directories(self, directories: Iterable[Path]) -> None:
+        directories = tuple(sorted(set(directories)))
+        sources = self.store.sources()
+        for directory in directories:
+            if directory in self.excluded_directories:
+                continue
+            if not directory.is_absolute() or not any(
+                directory.is_relative_to(Path(source.path)) for source in sources
+            ):
+                raise FileAccessError("请选择已关联来源下的目录。")
+            try:
+                _require_directory(directory)
+            except OSError as error:
+                raise FileAccessError(_reason(error)) from error
+        self.store.set_preference(_EXCLUSIONS, json.dumps(list(map(str, directories))))
+        self.excluded_directories = directories
+
+    def prune_excluded(self, source: Source) -> None:
+        root = Path(source.path)
+        excluded = [
+            file.id
+            for file in self.store.source_files(source.id).values()
+            if self.excluded(self.path_for(file), root)
+        ]
+        self.store.remove_linked_files(excluded)
+
+    def _external(self, path: Path, root: Path | None = None) -> tuple[Path, os.stat_result]:
         info = _inspect(path)
         actual = path.resolve(strict=True)
-        if (_is_hidden(info) and actual.parent != actual) or self.excluded(actual):
-            raise FileAccessError("跳过隐藏文件、敏感配置或系统和应用数据目录。")
+        if root is not None and not actual.is_relative_to(root):
+            raise FileAccessError("文件路径超出已关联目录。")
+        if (_is_hidden(info) and actual.parent != actual) or self.excluded(
+            actual, root, directory=stat.S_ISDIR(info.st_mode)
+        ):
+            raise FileAccessError("该路径属于排除目录、系统或应用数据，或包含隐藏文件和敏感配置。")
         return actual, info
 
     def path_for(self, file: FileRecord) -> Path:
@@ -172,9 +249,7 @@ class Library:
             if not path.resolve(strict=True).is_relative_to(self.paths.workspace):
                 raise FileAccessError("文件路径超出受管工作区。")
         else:
-            actual, info = self._external(path)
-            if not actual.is_relative_to(Path(file.source_path)):
-                raise FileAccessError("文件路径超出已关联目录。")
+            _, info = self._external(path, Path(file.source_path))
         _require_file(info)
         return info
 
@@ -236,6 +311,8 @@ class Library:
         root, info = self._external(Path(os.path.abspath(path)))
         if not stat.S_ISDIR(info.st_mode):
             raise FileAccessError("请选择要关联的资料目录。")
+        if self.excluded(root, directory=True, source_root=root):
+            raise FileAccessError("此目录已被设为不索引。")
         for existing in self.store.sources():
             existing_root = Path(existing.path)
             if root.is_relative_to(existing_root):
@@ -283,14 +360,13 @@ class Library:
                         if cancelled():
                             return found, "扫描已中止。"
                         path = Path(entry.path)
-                        if (
-                            _excluded_name(entry.name)
-                            or path in skip
-                            or any(path == item for item in self.excluded_roots)
-                        ):
+                        if path in skip:
                             continue
                         extension = file_extension(path)
-                        if extension not in EXTENSIONS and not entry.is_dir(follow_symlinks=False):
+                        directory_entry = entry.is_dir(follow_symlinks=False)
+                        if (not directory_entry and extension not in EXTENSIONS) or self.excluded(
+                            path, directory=directory_entry, source_root=root
+                        ):
                             continue
                         try:
                             info = entry.stat(follow_symlinks=False)
@@ -325,6 +401,10 @@ class Library:
     ) -> None:
         self.store.update_source(source.id, "scanning")
         root = Path(source.path)
+        if self.excluded(root, directory=True, source_root=root):
+            self.prune_excluded(source)
+            self.store.update_source(source.id, "excluded", "此来源已被索引规则排除。")
+            return
         try:
             actual, info = self._external(root)
             if actual != root or not stat.S_ISDIR(info.st_mode):
@@ -346,6 +426,12 @@ class Library:
             self.store.update_source(source.id, "pending", "扫描已中止，可在下次启动继续。")
             return
         existing = self.store.source_files(source.id)
+        excluded = {
+            key
+            for key, file in existing.items()
+            if key not in found and self.excluded(self.path_for(file), source_root=root)
+        }
+        self.store.remove_linked_files([existing[key].id for key in excluded])
         if not catalog_only:
             self.store.update_source(
                 source.id, "indexing", f"发现 {len(found)} 个文件，正在补建内容索引。"
@@ -365,7 +451,7 @@ class Library:
         if cancelled():
             return
         for key, file in existing.items():
-            if key not in found and file.status != "missing":
+            if key not in found and key not in excluded and file.status != "missing":
                 self.store.unavailable(file.id, "missing", "完整扫描时未找到该文件。")
         self.store.update_source(
             source.id, "indexing" if catalog_only else "ready", f"已登记 {len(found)} 个文件。"
@@ -385,7 +471,7 @@ class Library:
                 return
             if (
                 not path.is_relative_to(root)
-                or self.excluded(path, root)
+                or self.excluded(path, source_root=root)
                 or file_extension(path) not in EXTENSIONS
             ):
                 continue
@@ -456,8 +542,13 @@ class Library:
 
         signature = _fingerprint(info)
         metadata = file.extension not in TEXT_EXTENSIONS or info.st_size > MAX_FILE_BYTES
+        parser_version = (
+            OFFICE_PARSER_VERSION if not metadata and file.extension in RECHUNKED_EXTENSIONS else 0
+        )
+        current_parser = file.parser_version == parser_version
         if (
             not force
+            and current_parser
             and (not verify or metadata)
             and file.status not in {"pending", "missing", "failed"}
             and signature == _stored_fingerprint(file)
@@ -471,12 +562,18 @@ class Library:
                 self.store.unavailable(file.id, "failed", _reason(error))
                 return True
             sha = hashlib.sha256(data).hexdigest()
-        if sha is not None and sha == file.sha256 and file.status != "pending" and not force:
+        if (
+            current_parser
+            and sha is not None
+            and sha == file.sha256
+            and file.status != "pending"
+            and not force
+        ):
             if signature != _stored_fingerprint(file):
                 self.store.update_file_stat(file.id, signature)
             return True
 
-        version = self.store.begin_index(file.id, sha, signature)
+        version = self.store.begin_index(file.id, sha, signature, parser_version=parser_version)
         name_terms = " ".join(keyword_terms(file.name))
         status, reason = "ready", ""
         try:
@@ -488,7 +585,7 @@ class Library:
                 elif not raw or not any(section.text.strip() for section in raw):
                     reason = "已登记文件名和路径。"
             else:
-                raw = parse_document(data, file.extension)
+                raw = parse_document(data, file.extension, temp_dir=self.paths.temporary)
             sections = [(section, split_section(section)) for section in raw]
             sections = [(section, chunks) for section, chunks in sections if chunks]
             current = self._file_info(file, path)

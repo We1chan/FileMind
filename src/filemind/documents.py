@@ -7,7 +7,7 @@ import posixpath
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, replace
 from io import BytesIO
 from pathlib import Path
@@ -38,6 +38,7 @@ MAX_SECTIONS = 20_000
 MAX_XML_BYTES = 8 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_PAGES = 1_000
+OFFICE_GROUP_CHARS = 320
 _INVALID_UNICODE = dict.fromkeys(range(0xD800, 0xE000), "\ufffd")
 
 
@@ -50,6 +51,7 @@ class Section:
     location: str
     text: str
     first_line: int | None = None
+    heading: str = ""
 
 
 def file_extension(path: Path) -> str:
@@ -57,7 +59,7 @@ def file_extension(path: Path) -> str:
     return suffixes if suffixes in ARCHIVE_EXTENSIONS else path.suffix.lower()
 
 
-def parse_document(data: bytes, extension: str) -> list[Section]:
+def parse_document(data: bytes, extension: str, *, temp_dir: Path) -> list[Section]:
     if len(data) > MAX_FILE_BYTES:
         raise DocumentError("文件超过 32 MiB。")
     if extension in (".md", ".txt"):
@@ -68,11 +70,14 @@ def parse_document(data: bytes, extension: str) -> list[Section]:
     executable = Path(sys.executable)
     if executable.stem.lower() == "pythonw":
         executable = executable.with_name("python.exe")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    directory = str(temp_dir)
     try:
         process = subprocess.run(
             [str(executable), "-m", "filemind.documents", extension],
             input=data,
             capture_output=True,
+            env=dict(os.environ, TMP=directory, TEMP=directory, TMPDIR=directory),
             timeout=25,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
@@ -218,27 +223,63 @@ def _word_blocks(container: Element) -> Iterator[Element]:
             yield from _word_blocks(element)
 
 
-def _word_sections(container: Element, prefix: str = "") -> Iterator[Section]:
+def _word_sections(container: Element, prefix: str = "", heading: str = "") -> Iterator[Section]:
     paragraphs = tables = 0
+    pending: list[tuple[int, str]] = []
+
+    def flush() -> Iterator[Section]:
+        yield from _row_sections(
+            iter(pending),
+            lambda first, last: _office_place(prefix, first, last, "段"),
+            heading=heading,
+        )
+        pending.clear()
+
     for element in _word_blocks(container):
         if _local(element) == "p":
             paragraphs += 1
             style = element.find("{*}pPr/{*}pStyle")
-            heading = style is not None and _attribute(style, "val").lower().startswith(
+            is_heading = style is not None and _attribute(style, "val").lower().startswith(
                 ("heading", "title", "标题")
             )
             location = f"{prefix}第 {paragraphs} 段"
-            yield Section(f"{location}（标题）" if heading else location, _paragraph_text(element))
+            value = _paragraph_text(element)
+            if is_heading:
+                yield from flush()
+                yield Section(f"{location}（标题）", value)
+                if value.strip():
+                    heading = value.strip()
+            elif value.strip():
+                pending.append((paragraphs, value))
             continue
 
+        yield from flush()
         tables += 1
         for row_number, row in enumerate(element.findall("{*}tr"), 1):
             column = 1
+            cells = []
             for cell in row.findall("{*}tc"):
                 place = f"{prefix}表 {tables} · 第 {row_number} 行第 {column} 列 · "
-                yield from _word_sections(cell, place)
+                cells.extend(
+                    section
+                    for section in _word_sections(cell, place, heading)
+                    if section.text.strip()
+                )
                 span = cell.find("{*}tcPr/{*}gridSpan")
                 column += max(1, int(_attribute(span, "val", "1"))) if span is not None else 1
+            if (
+                len(cells) > 1
+                and sum(len(section.text) + 1 for section in cells) <= OFFICE_GROUP_CHARS
+                and all("（标题）" not in section.location for section in cells)
+            ):
+                yield Section(
+                    f"{prefix}表 {tables} · 第 {row_number} 行",
+                    "\t".join(section.text for section in cells),
+                    heading=heading,
+                )
+            else:
+                yield from cells
+    yield from flush()
 
 
 def _slides(archive: ZipFile, part: str, root: Element) -> Iterator[Section]:
@@ -283,6 +324,35 @@ def _check_office_parts(archive: ZipFile) -> None:
         raise DocumentError("Office 文件的部件数量或解压体积超过上限。")
 
 
+def _office_place(prefix: str, first: int, last: int, unit: str) -> str:
+    number = str(first) if first == last else f"{first}–{last}"
+    return f"{prefix}第 {number} {unit}"
+
+
+def _row_sections(
+    rows: Iterator[tuple[int, str]], locate: Callable[[int, int], str], *, heading: str = ""
+) -> Iterator[Section]:
+    pending: list[tuple[int, str]] = []
+
+    def flush() -> Iterator[Section]:
+        if pending:
+            first, last = pending[0][0], pending[-1][0]
+            yield Section(
+                locate(first, last), "\n".join(text for _, text in pending), heading=heading
+            )
+            pending.clear()
+
+    for number, value in rows:
+        if pending and (
+            number != pending[-1][0] + 1
+            or len(value) + sum(len(text) + 1 for _, text in pending) > OFFICE_GROUP_CHARS
+            or len(pending) >= 6
+        ):
+            yield from flush()
+        pending.append((number, value))
+    yield from flush()
+
+
 def _sheet_sections(data: bytes) -> Iterator[Section]:
     from python_calamine import CalamineWorkbook
 
@@ -296,13 +366,18 @@ def _sheet_sections(data: bytes) -> Iterator[Section]:
                 continue
             if sheet.width * sheet.height > 500_000:
                 raise DocumentError("Excel 工作表的单元格范围超过解析上限。")
-            for number, cells in enumerate(sheet.to_python(), sheet.start[0] + 1):
-                values = [str(cell) for cell in cells if cell != ""]
-                if values:
-                    yield Section(f"工作表「{name}」· 第 {number} 行", "\t".join(values))
+            rows = (
+                (number, "\t".join(str(cell) for cell in cells if cell != ""))
+                for number, cells in enumerate(sheet.to_python(), sheet.start[0] + 1)
+            )
+            yield from _row_sections(
+                ((number, value) for number, value in rows if value),
+                lambda first, last: _office_place(f"工作表「{name}」· ", first, last, "行"),
+                heading=name,
+            )
 
 
-def _legacy_office_sections(data: bytes, extension: str) -> Iterator[Section]:
+def _legacy_office_sections(data: bytes, extension: str) -> Iterator[tuple[int, str]]:
     if os.name != "nt":
         raise DocumentError("旧版 Word 或 PowerPoint 需要 Windows 文档筛选器。")
     if not data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
@@ -349,7 +424,7 @@ def _legacy_office_sections(data: bytes, extension: str) -> Iterator[Section]:
                         raise DocumentError("提取的文本超过 200 万字符。")
                     parts.append(part)
                 if parts:
-                    yield Section(f"正文片段 {chunk}", "".join(parts))
+                    yield chunk, "".join(parts)
         except pythoncom.com_error as error:
             raise DocumentError("Windows 筛选器无法提取此旧版 Office 文件的正文。") from error
         finally:
@@ -367,7 +442,12 @@ def _parser_main() -> None:
         elif extension in SHEET_EXTENSIONS:
             sections = _sheet_sections(data)
         elif extension in LEGACY_OFFICE_EXTENSIONS:
-            sections = _legacy_office_sections(data, extension)
+            sections = _row_sections(
+                _legacy_office_sections(data, extension),
+                lambda first, last: (
+                    f"正文片段 {first}" if first == last else f"正文片段 {first}–{last}"
+                ),
+            )
         else:
             sections = _office_sections(data, extension)
         result = {"sections": [asdict(item) for item in _collect(sections)]}
