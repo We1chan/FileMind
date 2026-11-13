@@ -73,6 +73,8 @@ def test_rebuilds_filename_index_for_version_two_library(tmp_path: Path) -> None
         connection.execute("DROP INDEX files_by_status")
         connection.execute("DROP INDEX files_by_source")
         connection.execute("ALTER TABLE files DROP COLUMN identity")
+        connection.execute("ALTER TABLE files DROP COLUMN parser_version")
+        connection.execute("ALTER TABLE sections DROP COLUMN heading")
         connection.execute("PRAGMA user_version = 2")
 
     reopened = LocalStore(paths.database)
@@ -86,3 +88,24 @@ def test_rebuilds_filename_index_for_version_two_library(tmp_path: Path) -> None
     )
     hits = Search(migrated).find("known notes", "keyword").hits
     assert [hit.file.id for hit in hits] == [original.file.id]
+
+
+def test_version_three_library_gets_hash_index_without_changing_references(
+    library: Library,
+) -> None:
+    note = library.paths.root.parent / "notes.txt"
+    note.write_text("MigrationReferenceNeedle", encoding="utf-8")
+    library.import_files([note])
+    passage = library.preview_file(library.store.files()[0].id)
+    with closing(sqlite3.connect(library.paths.database)) as connection, connection:
+        connection.execute("DROP INDEX files_by_hash")
+        connection.execute("ALTER TABLE files DROP COLUMN parser_version")
+        connection.execute("ALTER TABLE sections DROP COLUMN heading")
+        connection.execute("PRAGMA user_version = 3")
+
+    assert library.store.initialize().schema_version == SCHEMA_VERSION
+    assert library.preview(passage.chunk_id, passage.file.version) == passage
+    with closing(sqlite3.connect(library.paths.database)) as connection:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'files_by_hash'"
+        ).fetchone() == ("files_by_hash",)

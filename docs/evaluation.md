@@ -29,8 +29,25 @@ MRR 使用每条有答案查询的首个正确文件排名，漏检按零计。�
 ## 复现
 
 ```powershell
+. .\scripts\dev-env.ps1
 uv run --locked python -m filemind --install-model --data-dir .\data\p0
 uv run --locked python -m samples.evaluate --model .\data\p0\models\bge-small-zh-v1.5.onnx --output .\data\p0\evaluation.json
 ```
 
 JSON 报告记录每条查询的前五结果、目标排名和无答案候选数。缺少模型时报告跳过语义与混合测量。此次实测运行了三种模式。远程问答使用本地模拟接口验证，未调用第三方模型服务。
+
+## 实盘回归 · 2026-11-14
+
+使用本机资料库中的课程资料、讲义和表格建立 36 条有标注的查询，并加入 6 条预计无答案的查询。目标按 SHA-256 匹配，完全相同的副本均算命中。评测通过 `Search.find` 使用只读 SQLite 连接和已有 BGE 向量，预热后取前 10 个结果。标注与逐条报告保存在本机 `data/evaluation/`。
+
+| 模式 | 基线 Hit@5 | 本轮 Hit@5 | 基线 MRR@10 | 本轮 MRR@10 | 基线 p95 | 本轮 p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 关键词 | 33/36 | 32/36 | 0.829 | 0.824 | 4.02 秒 | 2.73 秒 |
+| 混合 | 33/36 | 34/36 | 0.730 | 0.802 | 26.63 秒 | 2.91 秒 |
+
+最终复测开始时资料库有 12,843 条记录，后台扫描仍在运行。更早的固定快照复测混合 Hit@5 同为 34/36，p95 为 1.08 秒。本轮两种模式都对 5/6 条预计无答案的查询返回了结果。评测集来自一台机器，且用于本轮参数调整。复跑原有合成评测，混合 Hit@5 为 31/32，MRR 为 0.953，5 条无答案查询中 1 条有结果。纯语义 Hit@5 为 27/32，基线为 31/32。
+
+```powershell
+. .\scripts\dev-env.ps1
+uv run --locked python -m samples.evaluate_library --cases .\data\evaluation\cases.json --output .\data\evaluation\recheck.json
+```

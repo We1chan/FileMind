@@ -5,6 +5,7 @@
 在 Windows x64 的 PowerShell 中进入仓库根目录。开发解释器由 `.python-version` 指定，依赖版本由 `uv.lock` 锁定。
 
 ```powershell
+. .\scripts\dev-env.ps1
 uv sync --locked
 uv run --locked filemind
 uv run --locked python -m filemind --check --data-dir .\data\check
@@ -13,6 +14,8 @@ uv run --locked ruff format --check .
 uv run --locked pytest
 uv build --no-sources
 ```
+
+每个新的 PowerShell 会话先加载 `scripts/dev-env.ps1`。脚本只设置当前会话的路径，uv、受管 Python、Python 字节码和临时文件写到仓库的 `data/`。Ruff、pytest 和 jieba 也在该目录使用项目缓存。命令通过 Git 忽略的 `data/library/` 访问默认资料库。
 
 桌面测试默认使用 Qt 离屏平台，可在 Windows 交互会话中用原生插件复测。
 

@@ -322,19 +322,20 @@ class SearchPage(QWidget):
     def show_search(self, result: SearchResult) -> None:
         self.clear_results()
         summary = (
-            f"{MODE[result.mode]} · 显示 {len(result.hits)} 份文件"
+            f"{MODE[result.mode]} · 显示 {len(result.hits)} 条结果"
             if result.hits
             else "未找到匹配文件。"
         )
         self.note.setText(" ".join(filter(None, (summary, result.notice))))
         for hit in result.hits:
+            copies = f" · 共 {hit.copies} 份相同内容" if hit.copies > 1 else ""
             if hit.passages:
                 passage = hit.passages[0]
-                self._show_citation(Citation(passage, passage.text.strip()[:130]))
+                self._show_citation(Citation(passage, passage.text.strip()[:130]), copies=copies)
             else:
                 _add_item(
                     self.results,
-                    f"{hit.file.name}\n{file_origin(hit.file)} · {hit.file.relative_path}",
+                    f"{hit.file.name}{copies}\n{file_origin(hit.file)} · {hit.file.relative_path}",
                     hit.file,
                 )
 
@@ -347,14 +348,15 @@ class SearchPage(QWidget):
         for index, citation in enumerate(result.citations, 1):
             self._show_citation(citation, f"[{index}] ")
 
-    def _show_citation(self, citation: Citation, prefix: str = "") -> None:
+    def _show_citation(self, citation: Citation, prefix: str = "", *, copies: str = "") -> None:
         passage = citation.passage
         excerpt = " ".join(citation.quote.split())
         if len(excerpt) > 130:
             excerpt = excerpt[:130] + "…"
         _add_item(
             self.results,
-            f"{prefix}{passage.file.name}\n{passage.location} · {file_origin(passage.file)}\n{excerpt}",
+            f"{prefix}{passage.file.name}{copies}\n"
+            f"{passage.location} · {file_origin(passage.file)}\n{excerpt}",
             citation,
         )
 
@@ -409,7 +411,8 @@ class SettingsPage(QWidget):
         state.addLayout(toggles)
         self.open_button = button("打开数据目录", "OpenData")
         self.open_button.setProperty("primary", True)
-        state.addLayout(_actions(self.open_button))
+        self.exclusions_button = button("管理排除目录", "ManageExcludedDirectories")
+        state.addLayout(_actions(self.open_button, self.exclusions_button))
         layout.addWidget(card)
 
         layout.addWidget(label("关联目录与索引任务", "SectionTitle"))
@@ -434,6 +437,7 @@ class SettingsPage(QWidget):
             return
         self.tasks.clear()
         scan_state = {
+            "excluded": "已排除",
             "ready": "持续跟踪",
             "failed": "扫描不完整",
             "pending": "待扫描",

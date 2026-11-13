@@ -11,6 +11,7 @@ from pathlib import Path
 import jieba
 from tokenizers import BertWordPieceTokenizer
 
+from filemind.config import checkout_data_dir, installed_data_dir
 from filemind.documents import EXTENSIONS, Section, line_location
 
 MAX_MODEL_TOKENS = 512
@@ -41,17 +42,28 @@ def bge_tokenizer() -> BertWordPieceTokenizer:
     return BertWordPieceTokenizer(str(VOCAB_PATH), lowercase=False)
 
 
-def _terms(text: str) -> Iterator[str]:
+@cache
+def _jieba_tokenizer() -> jieba.Tokenizer:
+    directory = (checkout_data_dir() or installed_data_dir()) / "cache" / "jieba"
+    directory.mkdir(parents=True, exist_ok=True)
+    tokenizer = jieba.Tokenizer()
+    tokenizer.tmp_dir = str(directory)
+    return tokenizer
+
+
+def _terms(text: str, *, precise: bool = False) -> Iterator[str]:
+    tokenizer = _jieba_tokenizer()
+    cut = tokenizer.cut if precise else tokenizer.cut_for_search
     previous = 0
     for match in _TECHNICAL.finditer(text):
-        yield from jieba.cut_for_search(text[previous : match.start()])
+        yield from cut(text[previous : match.start()])
         yield match.group()
         previous = match.end()
-    yield from jieba.cut_for_search(text[previous:])
+    yield from cut(text[previous:])
 
 
-def keyword_terms(text: str) -> Iterator[str]:
-    for word in _terms(text.casefold()):
+def keyword_terms(text: str, *, precise: bool = False) -> Iterator[str]:
+    for word in _terms(text.casefold(), precise=precise):
         if word not in _STOP_WORDS and any(character.isalnum() for character in word):
             # FTS5 must see one token even when the term contains punctuation.
             yield "t" + word.encode("utf-8").hex()
@@ -59,6 +71,10 @@ def keyword_terms(text: str) -> Iterator[str]:
 
 def fts_query(query: str) -> str:
     return " OR ".join(list(dict.fromkeys(keyword_terms(query)))[:64])
+
+
+def significant_terms(query: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(keyword_terms(query, precise=True)))[:64]
 
 
 def catalog_terms(value: str) -> str:

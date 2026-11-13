@@ -40,7 +40,9 @@ class _Changes(FileSystemEventHandler):
             if not value:
                 continue
             path = Path(os.fsdecode(value))
-            if not path.is_relative_to(root) or self.service.library.excluded(path, root):
+            if not path.is_relative_to(root) or self.service.library.excluded(
+                path, directory=event.is_directory, source_root=root
+            ):
                 continue
             if self.service.owner(path) != self.source.id:
                 continue
@@ -142,13 +144,18 @@ class ContinuousIndex:
                 paths.add(path)
 
     def _sync_watches(self, sources: list[Source]) -> None:
+        roots = ((Path(source.path), source.id) for source in sources)
         self._source_roots = tuple(
             sorted(
-                ((Path(source.path), source.id) for source in sources),
+                (
+                    (root, source_id)
+                    for root, source_id in roots
+                    if not self.library.excluded(root, root, directory=True)
+                ),
                 key=lambda item: -len(item[0].parts),
             )
         )
-        wanted = {source.id for source in sources}
+        wanted = {source_id for _, source_id in self._source_roots}
         alive = {emitter.watch for emitter in self._observer.emitters if emitter.is_alive()}
         for source_id, watch in list(self._watches.items()):
             if source_id not in wanted or watch not in alive or self.paused:
@@ -157,7 +164,7 @@ class ContinuousIndex:
         if self.paused:
             return
         for source in sources:
-            if source.id in self._watches:
+            if source.id not in wanted or source.id in self._watches:
                 continue
             try:
                 self._watches[source.id] = self._observer.schedule(
