@@ -31,6 +31,10 @@ type ContentKey = str | int
 type Ranking = dict[ContentKey, tuple[int, list[int]]]
 
 
+def _content_hash(file: FileRecord) -> str | None:
+    return file.sha256 if file.size else None
+
+
 def _fuse(keyword: Ranking, semantic: Ranking) -> Ranking:
     scores: dict[ContentKey, float] = {}
     passages: Ranking = {}
@@ -54,12 +58,12 @@ class Search:
         self.store = library.store
         self.semantic = SemanticIndex(library.paths.model, self.store)
 
-    def _count_copies(
-        self, hits: list[SearchHit], scope: SearchScope, *, catalog: bool = False
-    ) -> tuple[SearchHit, ...]:
-        hashes = {hit.file.sha256 for hit in hits if hit.file.sha256}
-        counts = self.store.copy_counts(hashes, scope, catalog=catalog)
-        return tuple(replace(hit, copies=counts.get(hit.file.sha256, 1)) for hit in hits)
+    def _count_copies(self, hits: list[SearchHit], scope: SearchScope) -> tuple[SearchHit, ...]:
+        hashes = {sha256 for hit in hits if (sha256 := _content_hash(hit.file))}
+        counts = self.store.copy_counts(hashes, scope)
+        return tuple(
+            replace(hit, copies=counts.get(_content_hash(hit.file) or "", 1)) for hit in hits
+        )
 
     def find(
         self,
@@ -79,18 +83,13 @@ class Search:
             ids = self.store.filename_ranks(query, scope, max(120, limit * 4))
             records = self.store.files_by_id(set(ids))
             hits = []
-            seen: set[ContentKey] = set()
             for file_id in ids:
                 file = records.get(file_id)
                 if file is not None and self.library.catalog_current(file):
-                    key = file.sha256 or file.id
-                    if key in seen:
-                        continue
-                    seen.add(key)
                     hits.append(SearchHit(file, ()))
                     if len(hits) >= limit:
                         break
-            return SearchResult(self._count_copies(hits, scope, catalog=True), mode)
+            return SearchResult(tuple(hits), mode)
 
         notice = ""
         semantic_rows = []
@@ -139,7 +138,7 @@ class Search:
                 file = files.get(file_id)
                 if file is None:
                     continue
-                key = file.sha256 or file_id
+                key = _content_hash(file) or file_id
                 if len(results) >= rank_limit and key not in results:
                     continue
                 if file_id not in current:
@@ -156,7 +155,7 @@ class Search:
         for file_id in catalog_ids:
             file = files.get(file_id)
             if file is not None and self.library.catalog_current(file):
-                key = file.sha256 or file_id
+                key = _content_hash(file) or file_id
                 catalog.setdefault(key, keyword.get(key, (file_id, [])))
         keyword = {**catalog, **keyword}
         if mode == "hybrid":

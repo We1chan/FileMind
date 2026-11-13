@@ -211,7 +211,8 @@ def test_search_folds_identical_content_within_scope_and_keeps_a_current_preview
     hits = search.find("uniqueDuplicateNeedle", "keyword").hits
     assert len(hits) == 1 and hits[0].copies == 2
     names = search.find("copy-", "filename").hits
-    assert len(names) == 1 and names[0].copies == 2
+    assert {hit.file.name for hit in names} == {first.name, second.name}
+    assert all(hit.copies == 1 for hit in names)
     records = {file.name: file for file in library.store.files()}
     second_id = records[second.name].id
     scoped = search.find(
@@ -223,6 +224,20 @@ def test_search_folds_identical_content_within_scope_and_keeps_a_current_preview
     assert current.file.id == second_id
     passage = current.passages[0]
     assert library.preview(passage.chunk_id, current.file.version).text == "uniqueDuplicateNeedle"
+
+
+@pytest.mark.parametrize("mode", ["filename", "keyword"])
+def test_search_lists_empty_files_separately(library: Library, tmp_path: Path, mode: str) -> None:
+    first, second = tmp_path / "todo-a.txt", tmp_path / "todo-b.txt"
+    for path in (first, second):
+        path.touch()
+    library.import_files([first, second])
+    records = library.store.files()
+    assert all(file.size == 0 for file in records) and records[0].sha256 == records[1].sha256
+
+    hits = Search(library).find("todo", mode).hits
+    assert {hit.file.name for hit in hits} == {first.name, second.name}
+    assert all(hit.copies == 1 for hit in hits)
 
 
 def test_retries_a_failed_parse_and_uses_actual_wordpiece_boundaries(

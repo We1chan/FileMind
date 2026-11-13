@@ -462,10 +462,10 @@ class LocalStore:
                 result.update((row["id"], _file(row)) for row in rows)
         return result
 
-    def copy_counts(self, hashes: set[str], scope: SearchScope, *, catalog: bool) -> dict[str, int]:
+    def copy_counts(self, hashes: set[str], scope: SearchScope) -> dict[str, int]:
         if not hashes:
             return {}
-        clause, parameters = scope.clause(catalog=catalog)
+        clause, parameters = scope.clause()
         counts = {}
         ordered = sorted(hashes)
         with self._session() as connection:
@@ -475,7 +475,8 @@ class LocalStore:
                 counts.update(
                     connection.execute(
                         f"""SELECT f.sha256, count(*) FROM files f
-                        WHERE f.sha256 IN ({placeholders}) AND {clause} GROUP BY f.sha256""",
+                        WHERE f.sha256 IN ({placeholders}) AND f.size > 0 AND {clause}
+                        GROUP BY f.sha256""",
                         (*batch, *parameters),
                     )
                 )
