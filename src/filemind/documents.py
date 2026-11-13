@@ -6,6 +6,7 @@ import os
 import posixpath
 import subprocess
 import sys
+import tempfile
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from io import BytesIO
@@ -16,7 +17,21 @@ from zipfile import ZipFile
 
 from defusedxml.ElementTree import fromstring
 
-EXTENSIONS = (".pdf", ".docx", ".pptx", ".md", ".txt")
+WORD_EXTENSIONS = (".docx", ".docm")
+SLIDE_EXTENSIONS = (".pptx", ".pptm")
+LEGACY_OFFICE_EXTENSIONS = (".doc", ".ppt")
+SHEET_EXTENSIONS = (".xlsx", ".xls", ".xlsm", ".xlsb")
+ARCHIVE_EXTENSIONS = (".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz", ".tar.xz", ".tar.bz2")
+TEXT_EXTENSIONS = (
+    ".pdf",
+    *WORD_EXTENSIONS,
+    *SLIDE_EXTENSIONS,
+    *SHEET_EXTENSIONS,
+    *LEGACY_OFFICE_EXTENSIONS,
+    ".md",
+    ".txt",
+)
+EXTENSIONS = (*TEXT_EXTENSIONS, *ARCHIVE_EXTENSIONS, ".exe")
 MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_TEXT_CHARS = 2_000_000
 MAX_SECTIONS = 20_000
@@ -36,12 +51,17 @@ class Section:
     first_line: int | None = None
 
 
+def file_extension(path: Path) -> str:
+    suffixes = "".join(path.suffixes[-2:]).lower()
+    return suffixes if suffixes in ARCHIVE_EXTENSIONS else path.suffix.lower()
+
+
 def parse_document(data: bytes, extension: str) -> list[Section]:
     if len(data) > MAX_FILE_BYTES:
         raise DocumentError("文件超过 32 MiB。")
     if extension in (".md", ".txt"):
         return _collect(_text_sections(data))
-    if extension not in EXTENSIONS:
+    if extension not in TEXT_EXTENSIONS:
         raise DocumentError("不支持此文件格式。")
 
     executable = Path(sys.executable)
@@ -237,12 +257,10 @@ def _slides(archive: ZipFile, part: str, root: Element) -> Iterator[Section]:
 
 def _office_sections(data: bytes, extension: str) -> Iterator[Section]:
     with ZipFile(BytesIO(data)) as archive:
-        entries = archive.infolist()
-        if len(entries) > 5_000 or sum(entry.file_size for entry in entries) > MAX_ARCHIVE_BYTES:
-            raise DocumentError("Office 文件的部件数量或解压体积超过上限。")
+        _check_office_parts(archive)
         part = _office_part(archive)
         root = _xml(archive, part)
-        if extension == ".docx":
+        if extension in WORD_EXTENSIONS:
             body = root.find("{*}body")
             if body is None:
                 raise DocumentError("DOCX 文件缺少正文。")
@@ -251,13 +269,99 @@ def _office_sections(data: bytes, extension: str) -> Iterator[Section]:
             yield from _slides(archive, part, root)
 
 
+def _check_office_parts(archive: ZipFile) -> None:
+    entries = archive.infolist()
+    if len(entries) > 5_000 or sum(entry.file_size for entry in entries) > MAX_ARCHIVE_BYTES:
+        raise DocumentError("Office 文件的部件数量或解压体积超过上限。")
+
+
+def _sheet_sections(data: bytes) -> Iterator[Section]:
+    from python_calamine import CalamineWorkbook
+
+    if data.startswith(b"PK"):
+        with ZipFile(BytesIO(data)) as archive:
+            _check_office_parts(archive)
+    with CalamineWorkbook.from_filelike(BytesIO(data)) as book:
+        for name in book.sheet_names:
+            sheet = book.get_sheet_by_name(name)
+            if sheet.start is None:
+                continue
+            if sheet.width * sheet.height > 500_000:
+                raise DocumentError("Excel 工作表的单元格范围超过解析上限。")
+            for number, cells in enumerate(sheet.to_python(), sheet.start[0] + 1):
+                values = [str(cell) for cell in cells if cell != ""]
+                if values:
+                    yield Section(f"工作表「{name}」· 第 {number} 行", "\t".join(values))
+
+
+def _legacy_office_sections(data: bytes, extension: str) -> Iterator[Section]:
+    if os.name != "nt":
+        raise DocumentError("旧版 Word 或 PowerPoint 需要 Windows 文档筛选器。")
+    if not data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        raise DocumentError("旧版 Office 文件缺少有效的复合文档头。")
+
+    import pythoncom
+    from win32com.ifilter import ifilter
+
+    with tempfile.TemporaryDirectory(prefix="filemind-office-") as directory:
+        snapshot = Path(directory) / f"source{extension}"
+        snapshot.write_bytes(data)
+        reader = None
+        total = 0
+        try:
+            reader = ifilter.LoadIFilter(str(snapshot))
+            reader.Init(
+                ifilter.IFILTER_INIT_INDEXING_ONLY | ifilter.IFILTER_INIT_APPLY_INDEX_ATTRIBUTES
+            )
+            while True:
+                try:
+                    chunk, _, flags, *_ = reader.GetChunk()
+                except pythoncom.com_error as error:
+                    if error.hresult == ifilter.FILTER_E_END_OF_CHUNKS:
+                        break
+                    raise
+                if not flags & ifilter.CHUNK_TEXT:
+                    continue
+                parts = []
+                while True:
+                    try:
+                        part = reader.GetText(8192)
+                    except pythoncom.com_error as error:
+                        if error.hresult in (
+                            ifilter.FILTER_E_NO_TEXT,
+                            ifilter.FILTER_E_NO_MORE_TEXT,
+                        ):
+                            break
+                        raise
+                    if not part:
+                        break
+                    part = part.replace("\0", "")
+                    total += len(part)
+                    if total > MAX_TEXT_CHARS:
+                        raise DocumentError("提取的文本超过 200 万字符。")
+                    parts.append(part)
+                if parts:
+                    yield Section(f"正文片段 {chunk}", "".join(parts))
+        except pythoncom.com_error as error:
+            raise DocumentError("Windows 筛选器无法提取此旧版 Office 文件的正文。") from error
+        finally:
+            del reader
+
+
 def _parser_main() -> None:
     try:
         data = sys.stdin.buffer.read(MAX_FILE_BYTES + 1)
         if len(data) > MAX_FILE_BYTES:
             raise DocumentError("文件超过 32 MiB。")
         extension = sys.argv[1]
-        sections = _pdf_sections(data) if extension == ".pdf" else _office_sections(data, extension)
+        if extension == ".pdf":
+            sections = _pdf_sections(data)
+        elif extension in SHEET_EXTENSIONS:
+            sections = _sheet_sections(data)
+        elif extension in LEGACY_OFFICE_EXTENSIONS:
+            sections = _legacy_office_sections(data, extension)
+        else:
+            sections = _office_sections(data, extension)
         result = {"sections": [asdict(item) for item in _collect(sections)]}
     except DocumentError as error:
         result = {"error": str(error)}

@@ -1,15 +1,19 @@
 """Desktop navigation and background operations."""
 
 import logging
+import os
 import sqlite3
+import subprocess
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt, QThread, QUrl
+from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -17,21 +21,26 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
+    QMessageBox,
     QPlainTextEdit,
     QSplitter,
     QStackedWidget,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
 
 from filemind import __version__
 from filemind.config import AppPaths
+from filemind.continuous import ContinuousIndex
 from filemind.documents import EXTENSIONS
 from filemind.library import FileAccessError, ImportReport, Library
 from filemind.qa import Questions, RemoteSettings
 from filemind.search import Search
 from filemind.storage import FileRecord, LocalStore, Passage, Source, StorageStatus
 from filemind.ui.pages import (
+    PAGE_SIZE,
     ROLE,
     STATUS,
     LibraryPage,
@@ -41,6 +50,7 @@ from filemind.ui.pages import (
     label,
 )
 from filemind.ui.theme import WINDOW_STYLE, application_icon
+from filemind.windows import common_locations, set_startup, starts_with_windows
 
 LAST_PAGE = "last_page"
 
@@ -114,7 +124,15 @@ class Task(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, paths: AppPaths, store: LocalStore, storage_status: StorageStatus) -> None:
+    def __init__(
+        self,
+        paths: AppPaths,
+        store: LocalStore,
+        storage_status: StorageStatus,
+        *,
+        monitor: bool = False,
+        startup_allowed: bool = False,
+    ) -> None:
         super().__init__()
         self.paths = paths
         self.store = store
@@ -122,9 +140,12 @@ class MainWindow(QMainWindow):
         self.search = Search(self.library)
         self.questions = Questions(self.search)
         self.remote = RemoteSettings.from_environment()
+        self.monitor = ContinuousIndex(self.library) if monitor else None
+        self.tray: QSystemTrayIcon | None = None
         self.task: Task | None = None
+        self._shutdown_task: Task | None = None
         self.closing = False
-        self.records: list[FileRecord] = []
+        self.offset = 0
         self.setWindowTitle("FileMind")
         self.setWindowIcon(application_icon())
         self.setMinimumSize(920, 580)
@@ -142,6 +163,10 @@ class MainWindow(QMainWindow):
         self.library_page = LibraryPage()
         self.search_page = SearchPage()
         self.settings_page = SettingsPage(storage_status, paths.root, self.remote)
+        self.settings_page.startup.setVisible(startup_allowed)
+        self.settings_page.startup.setChecked(startup_allowed and starts_with_windows())
+        self.settings_page.pause.setVisible(self.monitor is not None)
+        self.settings_page.pause.setChecked(self.monitor is not None and self.monitor.paused)
         bodies = (self.library_page, self.search_page, None, self.settings_page)
         for page, body in zip(PAGES, bodies, strict=True):
             item = QListWidgetItem(page.title)
@@ -165,8 +190,51 @@ class MainWindow(QMainWindow):
         self.navigation.currentRowChanged.connect(self._navigate)
         self._connect_actions()
         self._reload_library()
-        if self.records or self.settings_page.tasks.count():
+        if self.monitor is not None:
+            self.monitor.start()
+            self._setup_tray()
+            self._updates = QTimer(self)
+            self._updates.setInterval(1600)
+            self._updates.timeout.connect(self._background_status)
+            self._updates.start()
+        elif self.library_page.files.count() or self.settings_page.tasks.count():
             self._refresh()
+
+    def _setup_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip("FileMind · 本地资料库")
+        menu = QMenu(self)
+        menu.addAction("打开 FileMind", self.reveal)
+        pause = menu.addAction("暂停后台索引")
+        pause.setCheckable(True)
+        pause.setChecked(self.settings_page.pause.isChecked())
+        pause.toggled.connect(self.settings_page.pause.setChecked)
+        self.settings_page.pause.toggled.connect(pause.setChecked)
+        menu.addAction("立即刷新索引", self._refresh)
+        menu.addSeparator()
+        menu.addAction("退出 FileMind", self.quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.show()
+
+    def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.reveal()
+
+    def reveal(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self._reload_library()
+
+    def quit(self) -> None:
+        self.closing = True
+        self.close()
 
     def _make_shell(self) -> QWidget:
         shell = QWidget()
@@ -280,9 +348,14 @@ class MainWindow(QMainWindow):
     def _connect_actions(self) -> None:
         library = self.library_page
         library.import_button.clicked.connect(self._import_files)
+        library.common_button.clicked.connect(self._add_common)
         library.link_button.clicked.connect(self._link_directory)
         library.refresh_button.clicked.connect(self._refresh)
+        library.filter.textChanged.connect(lambda: self._page(0, reset=True))
+        library.previous.clicked.connect(lambda: self._page(-PAGE_SIZE))
+        library.next.clicked.connect(lambda: self._page(PAGE_SIZE))
         library.preview_button.clicked.connect(self._preview_file)
+        library.locate_button.clicked.connect(lambda: self._locate(library.selected_file()))
         library.files.itemActivated.connect(self._preview_file)
         library.files.currentItemChanged.connect(self._file_detail)
         library.retry_button.clicked.connect(lambda: self._retry(library.selected_file()))
@@ -291,7 +364,8 @@ class MainWindow(QMainWindow):
         search.find_button.clicked.connect(lambda: self._search(False))
         search.query.returnPressed.connect(lambda: self._search(False))
         search.ask_button.clicked.connect(lambda: self._search(True))
-        search.scope_button.clicked.connect(lambda: search.choose_scope(self.records))
+        search.scope_button.clicked.connect(lambda: search.choose_scope(self.store))
+        search.locate_button.clicked.connect(lambda: self._locate(self._result_file()))
         search.results.itemClicked.connect(self._preview_citation)
         search.results.itemActivated.connect(self._preview_citation)
 
@@ -300,16 +374,28 @@ class MainWindow(QMainWindow):
         settings.tasks.currentItemChanged.connect(self._task_detail)
         settings.retry_button.clicked.connect(lambda: self._retry(settings.selected_task()))
         settings.unlink_button.clicked.connect(self._unlink_directory)
+        settings.startup.toggled.connect(self._toggle_startup)
+        if self.monitor is not None:
+            settings.pause.toggled.connect(self.monitor.pause)
 
     def _start(
         self,
         message: str,
         operation: Callable[[Callable[[], bool]], Any],
         completed: Callable[[Any], None],
+        *,
+        writes: bool = False,
     ) -> None:
         if self.task is not None or self.closing:
             return
-        self.task = Task(self, operation, completed)
+
+        def run(stop: Callable[[], bool]) -> Any:
+            with (
+                self.monitor.foreground() if writes and self.monitor is not None else nullcontext()
+            ):
+                return None if stop() else operation(stop)
+
+        self.task = Task(self, run, completed)
         self.task.finished.connect(self._finished)
         self._enable_actions(False)
         self.statusBar().showMessage(message)
@@ -338,18 +424,83 @@ class MainWindow(QMainWindow):
             task.completed(task.result)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self.tray is not None and not self.closing:
+            self.hide()
+            event.ignore()
+            return
         if self.task is not None:
             self.closing = True
+            if self.monitor is not None:
+                self.monitor.request_stop()
             self.task.requestInterruption()
             self.statusBar().showMessage("当前操作结束后关闭窗口。")
             event.ignore()
             return
+        if self.tray is not None:
+            self.tray.hide()
+        if self.monitor is not None:
+            if self._shutdown_task is None:
+                self.monitor.request_stop()
+                self.statusBar().showMessage("正在停止后台索引…")
+                monitor = self.monitor
+                self._shutdown_task = Task(self, lambda _: monitor.stop(), lambda _: None)
+                self._shutdown_task.finished.connect(self._monitor_stopped)
+                self._shutdown_task.start()
+            event.ignore()
+            return
         super().closeEvent(event)
+        if self.tray is not None:
+            QApplication.quit()
+
+    def _monitor_stopped(self) -> None:
+        assert self._shutdown_task is not None
+        self._shutdown_task.wait()
+        self._shutdown_task.deleteLater()
+        self._shutdown_task = None
+        self.monitor = None
+        self.close()
+
+    def shutdown(self) -> None:
+        if self.task is not None:
+            self.task.requestInterruption()
+            self.task.wait()
+        if self._shutdown_task is not None:
+            self._shutdown_task.wait()
+        elif self.monitor is not None:
+            self.monitor.stop()
 
     def _reload_library(self) -> None:
-        self.records = self.store.files()
-        self.library_page.show_files(self.records)
-        self.settings_page.show_tasks(self.records, self.store.sources())
+        page = self.library_page
+        query = page.filter.text().strip()
+        records = self.store.files(limit=PAGE_SIZE + 1, offset=self.offset, name=query)
+        if not records and self.offset:
+            self.offset = 0
+            records = self.store.files(limit=PAGE_SIZE + 1, name=query)
+        page.show_files(records, self.store.counts(), self.offset)
+        sources = self.store.sources()
+        self.settings_page.show_tasks(self.store.files(limit=100, status="tasks"), sources)
+        self.search_page.show_sources(sources)
+
+    def _page(self, shift: int, *, reset: bool = False) -> None:
+        self.offset = 0 if reset else max(0, self.offset + shift)
+        self._reload_library()
+
+    def _background_status(self) -> None:
+        if not self.isVisible() or self.task is not None or self.monitor is None:
+            return
+        self._reload_library()
+        if self.monitor.error:
+            self.statusBar().showMessage(self.monitor.error, 1500)
+
+    def _toggle_startup(self, enabled: bool) -> None:
+        try:
+            set_startup(enabled)
+        except OSError:
+            checkbox = self.settings_page.startup
+            checkbox.blockSignals(True)
+            checkbox.setChecked(starts_with_windows())
+            checkbox.blockSignals(False)
+            self.statusBar().showMessage("无法更新 Windows 登录启动设置。", 6500)
 
     def _after_index(self, _result: object = None) -> None:
         self._reload_library()
@@ -371,6 +522,7 @@ class MainWindow(QMainWindow):
                 "正在保存受管副本并建立索引…",
                 lambda stop: self.library.import_files(map(Path, files), stop),
                 self._imported,
+                writes=True,
             )
 
     def _imported(self, report: ImportReport) -> None:
@@ -390,10 +542,45 @@ class MainWindow(QMainWindow):
         )
         if directory:
             self._start(
-                "正在扫描关联目录…",
-                lambda stop: self.library.link_directory(Path(directory), stop),
-                self._after_index,
+                "正在登记关联目录…",
+                lambda stop: (
+                    self.library.register_directory(Path(directory))
+                    if self.monitor is not None
+                    else self.library.link_directory(Path(directory), stop)
+                ),
+                self._sources_changed,
+                writes=True,
             )
+
+    def _add_common(self) -> None:
+        paths = common_locations()
+        if not paths:
+            self.statusBar().showMessage("未找到可关联的文档、下载或 D 盘。", 6000)
+            return
+        message = QMessageBox(self)
+        message.setWindowTitle("接入常用位置")
+        message.setTextFormat(Qt.TextFormat.PlainText)
+        message.setText("将持续只读索引以下位置。\n\n" + "\n".join(map(str, paths)))
+        apply = message.addButton("接入并开始索引", QMessageBox.ButtonRole.AcceptRole)
+        message.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        message.exec()
+        if message.clickedButton() != apply:
+            return
+
+        def add(stop: Callable[[], bool]) -> None:
+            for path in paths:
+                if stop():
+                    return
+                self.library.register_directory(path)
+            if self.monitor is None:
+                self.library.refresh(stop)
+
+        self._start("正在登记常用位置…", add, self._sources_changed, writes=True)
+
+    def _sources_changed(self, _result: object = None) -> None:
+        self._reload_library()
+        if self.monitor is not None:
+            self.monitor.refresh()
 
     def _unlink_directory(self) -> None:
         source = self.settings_page.selected_task()
@@ -401,15 +588,27 @@ class MainWindow(QMainWindow):
             self._start(
                 "正在取消目录关联…",
                 lambda _: self.store.remove_source(source.id),
-                self._after_index,
+                self._sources_changed,
+                writes=True,
             )
 
     def _refresh(self) -> None:
-        self._start("正在检查文件变化并更新索引…", self.library.refresh, self._after_index)
+        if self.monitor is not None and not self.monitor.paused:
+            self.monitor.refresh()
+            self.statusBar().showMessage("已请求后台刷新索引。", 3500)
+        else:
+            self._start(
+                "正在检查文件变化并更新索引…", self.library.refresh, self._after_index, writes=True
+            )
 
     def _retry(self, entry: FileRecord | Source | None) -> None:
         if isinstance(entry, FileRecord):
-            self._start("正在重试索引…", lambda _: self.library.retry(entry.id), self._after_index)
+            self._start(
+                "正在重试索引…",
+                lambda _: self.library.retry(entry.id),
+                self._after_index,
+                writes=True,
+            )
         elif isinstance(entry, Source):
             self._refresh()
 
@@ -453,19 +652,23 @@ class MainWindow(QMainWindow):
             remote = self.remote if self.settings_page.remote.isChecked() else None
             self._start(
                 "正在检索证据并生成问答…",
-                lambda stop: self.questions.ask(query, mode, scope, remote, stop),
+                lambda stop: self.questions.ask(
+                    query, mode, scope, remote, stop, wait_for_vectors=self.monitor is None
+                ),
                 page.show_answer,
             )
         else:
             self._start(
                 "正在检索资料库…",
-                lambda stop: self.search.find(query, mode, scope, cancelled=stop),
+                lambda stop: self.search.find(
+                    query, mode, scope, cancelled=stop, wait_for_vectors=self.monitor is None
+                ),
                 page.show_search,
             )
 
     def _preview_file(self) -> None:
         file = self.library_page.selected_file()
-        if file is not None and file.status == "ready":
+        if file is not None and file.status in {"ready", "cataloged"}:
             self._start(
                 "正在核对原文…",
                 lambda _: self.library.preview_file(file.id),
@@ -474,12 +677,38 @@ class MainWindow(QMainWindow):
 
     def _preview_citation(self, item: QListWidgetItem) -> None:
         citation = item.data(ROLE)
+        if isinstance(citation, FileRecord):
+            self._reset_detail()
+            self.detail_title.setText("文件详情")
+            self._display_file(citation)
+            return
         passage = citation.passage
         self._start(
             "正在核对原文…",
             lambda _: self.library.preview(passage.chunk_id, passage.file.version),
             lambda verified: self._show_preview(verified, 1, citation.quote),
         )
+
+    def _result_file(self) -> FileRecord | None:
+        item = self.search_page.results.currentItem()
+        if item is None:
+            return None
+        entry = item.data(ROLE)
+        return entry if isinstance(entry, FileRecord) else entry.passage.file
+
+    def _locate(self, file: FileRecord | None) -> None:
+        if file is None or not self.library.catalog_current(file):
+            self.statusBar().showMessage("文件已移动或无法访问。", 5000)
+            return
+        path = self.library.path_for(file)
+        try:
+            if os.name == "nt":
+                explorer = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "explorer.exe"
+                subprocess.Popen(f'"{explorer}" /select,"{path}"', executable=str(explorer))
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+        except OSError:
+            self.statusBar().showMessage("无法在资源管理器中定位文件。", 5000)
 
     def _show_preview(self, passage: Passage, page: int, quote: str = "") -> None:
         if self.pages.currentIndex() != page:

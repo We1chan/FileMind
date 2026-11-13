@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 from filemind.documents import EXTENSIONS
 from filemind.qa import Answer, Citation, RemoteSettings
 from filemind.search import MAX_QUERY_CHARS, SearchMode, SearchResult
-from filemind.storage import FileRecord, SearchScope, Source, StorageStatus
+from filemind.storage import FileRecord, LocalStore, SearchScope, Source, StorageStatus
 
 ROLE = Qt.ItemDataRole.UserRole
 STATUS = {
@@ -35,8 +35,15 @@ STATUS = {
     "missing": "文件缺失",
     "ocr": "需要 OCR",
     "empty": "无可索引文本",
+    "cataloged": "已登记 · 文件信息",
 }
-MODE = {"hybrid": "混合检索", "keyword": "关键词检索", "semantic": "语义检索"}
+MODE = {
+    "hybrid": "混合检索",
+    "keyword": "关键词检索",
+    "semantic": "语义检索",
+    "filename": "文件名与路径",
+}
+PAGE_SIZE = 200
 
 
 def label(text: str, role: str, *, wrap: bool = False) -> QLabel:
@@ -55,7 +62,10 @@ def button(text: str, name: str = "Action") -> QPushButton:
 
 
 def file_origin(file: FileRecord) -> str:
-    return f"关联 · {Path(file.source_path).name}" if file.source_path else "受管副本"
+    if not file.source_path:
+        return "受管副本"
+    root = Path(file.source_path)
+    return f"关联 · {root.name or root.anchor}"
 
 
 def _list(name: str, accessible_name: str) -> QListWidget:
@@ -93,15 +103,30 @@ class LibraryPage(QWidget):
         self.import_button = button("导入文件", "ImportFiles")
         self.import_button.setProperty("primary", True)
         self.link_button = button("关联目录", "LinkDirectory")
+        self.common_button = button("接入常用位置", "CommonLocations")
         self.refresh_button = button("刷新索引", "RefreshIndex")
-        layout.addLayout(_actions(self.import_button, self.link_button, self.refresh_button))
+        layout.addLayout(
+            _actions(self.common_button, self.link_button, self.import_button, self.refresh_button)
+        )
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("按文件名或路径筛选")
+        self.filter.setAccessibleName("筛选文件库")
+        self.filter.setClearButtonEnabled(True)
+        layout.addWidget(self.filter)
         self.summary = label("", "Hint", wrap=True)
         layout.addWidget(self.summary)
         self.files = _list("LibraryFiles", "资料库文件")
         layout.addWidget(self.files, 1)
         self.preview_button = button("预览原文", "PreviewFile")
+        self.locate_button = button("定位文件", "LocateFile")
         self.retry_button = button("重试索引", "RetryIndex")
-        layout.addLayout(_actions(self.preview_button, self.retry_button))
+        self.previous = button("上一页")
+        self.next = button("下一页")
+        layout.addLayout(
+            _actions(
+                self.preview_button, self.locate_button, self.retry_button, self.previous, self.next
+            )
+        )
         self.files.currentItemChanged.connect(self._update_actions)
         self._update_actions()
 
@@ -109,24 +134,37 @@ class LibraryPage(QWidget):
         item = self.files.currentItem()
         return item.data(ROLE) if item is not None else None
 
-    def show_files(self, records: list[FileRecord]) -> None:
+    def show_files(self, records: list[FileRecord], counts: tuple[int, int], offset: int) -> None:
         selected = self.selected_file()
-        self.files.clear()
-        for file in records:
-            item = _add_item(
-                self.files, f"{file.name}\n{file_origin(file)} · {STATUS[file.status]}", file
-            )
-            if selected is not None and file.id == selected.id:
-                self.files.setCurrentItem(item)
-        self.summary.setText(
-            f"{len(records)} 份文件 · {sum(file.status == 'ready' for file in records)} 份已索引"
-            if records
-            else "导入文件以保存副本，或关联目录以只读接入。"
-        )
+        visible = records[:PAGE_SIZE]
+        if self.files.count() != len(visible) or any(
+            self.files.item(i).data(ROLE) != file for i, file in enumerate(visible)
+        ):
+            self.files.clear()
+            for file in visible:
+                item = _add_item(
+                    self.files, f"{file.name}\n{file_origin(file)} · {STATUS[file.status]}", file
+                )
+                if selected is not None and file.id == selected.id:
+                    self.files.setCurrentItem(item)
+        total, indexed = counts
+        summary = f"共 {total:,} 个文件 · {indexed:,} 个已处理"
+        if visible:
+            summary += f" · 显示第 {offset + 1:,}–{offset + len(visible):,} 个"
+        elif self.filter.text().strip():
+            summary = "没有匹配的文件。"
+        elif not total:
+            summary = "接入常用位置或关联目录后，文件会陆续出现在这里。"
+        self.summary.setText(summary)
+        self.previous.setEnabled(offset > 0)
+        self.next.setEnabled(len(records) > PAGE_SIZE)
 
     def _update_actions(self) -> None:
         selected = self.selected_file()
-        self.preview_button.setEnabled(selected is not None and selected.status == "ready")
+        self.preview_button.setEnabled(
+            selected is not None and selected.status in {"ready", "cataloged"}
+        )
+        self.locate_button.setEnabled(selected is not None and selected.status != "missing")
         self.retry_button.setEnabled(selected is not None and selected.status != "ready")
 
 
@@ -185,37 +223,92 @@ class SearchPage(QWidget):
         layout.addWidget(self.answer)
         self.results = _list("SearchResults", "检索结果与问答引用")
         layout.addWidget(self.results, 1)
+        self.locate_button = button("定位选中文件", "LocateResult")
+        self.locate_button.setEnabled(False)
+        self.results.currentItemChanged.connect(
+            lambda: self.locate_button.setEnabled(self.results.currentItem() is not None)
+        )
+        layout.addLayout(_actions(self.locate_button))
+
+    def show_sources(self, sources: list[Source]) -> None:
+        current = self.source.currentData()
+        items = [("全部来源", None), ("受管副本", "managed"), ("关联目录", "linked")]
+        items.extend(
+            (Path(source.path).name or Path(source.path).anchor, source.id) for source in sources
+        )
+        if [self.source.itemData(index) for index in range(self.source.count())] == [
+            key for _, key in items
+        ]:
+            return
+        self.source.clear()
+        for name, key in items:
+            self.source.addItem(name, key)
+        self.source.setCurrentIndex(max(0, self.source.findData(current)))
 
     def filters(self) -> tuple[SearchMode, SearchScope]:
+        source = self.source.currentData()
         return self.mode.currentData(), SearchScope(
-            self.extension.currentData(), self.source.currentData(), self.file_ids
+            self.extension.currentData(),
+            source if isinstance(source, str) else None,
+            self.file_ids,
+            source_id=source if isinstance(source, int) else None,
         )
 
-    def choose_scope(self, files: list[FileRecord]) -> None:
+    def choose_scope(self, store: LocalStore) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("选择文件范围")
         dialog.resize(460, 360)
         layout = QVBoxLayout(dialog)
         layout.addWidget(label("选择一份或多份文件。留空时使用全部文件。", "Hint", wrap=True))
+        query = QLineEdit()
+        query.setPlaceholderText("输入文件名以筛选")
+        layout.addWidget(query)
         choices = _list("ScopeFiles", "文件范围")
         choices.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
-        for file in files:
-            if file.status == "ready":
+        selected = set(self.file_ids or ())
+        hint = label("", "Hint")
+        layout.addWidget(hint)
+
+        def update_selection() -> None:
+            for index in range(choices.count()):
+                item = choices.item(index)
+                (selected.add if item.isSelected() else selected.discard)(item.data(ROLE))
+            hint.setText(f"已选 {len(selected)} 个 · 最多显示 200 个匹配项")
+
+        def populate() -> None:
+            choices.blockSignals(True)
+            choices.clear()
+            for file in store.files(
+                limit=PAGE_SIZE, name=query.text().strip(), status="searchable"
+            ):
                 item = _add_item(
                     choices, f"{file.name}\n{file_origin(file)} · {file.relative_path}", file.id
                 )
-                item.setSelected(self.file_ids is not None and file.id in self.file_ids)
+                item.setSelected(file.id in selected)
+            choices.blockSignals(False)
+            hint.setText(f"已选 {len(selected)} 个 · 最多显示 200 个匹配项")
+
+        choices.itemSelectionChanged.connect(update_selection)
+        query.textChanged.connect(populate)
+        populate()
         layout.addWidget(choices)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("应用")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        clear = buttons.addButton("清空选择", QDialogButtonBox.ButtonRole.ResetRole)
+
+        def clear_selection() -> None:
+            selected.clear()
+            populate()
+
+        clear.clicked.connect(clear_selection)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.file_ids = tuple(item.data(ROLE) for item in choices.selectedItems()) or None
+            self.file_ids = tuple(sorted(selected)) or None
             self.scope_button.setText(
                 f"指定 {len(self.file_ids)} 份" if self.file_ids else "全部文件"
             )
@@ -235,8 +328,15 @@ class SearchPage(QWidget):
         )
         self.note.setText(" ".join(filter(None, (summary, result.notice))))
         for hit in result.hits:
-            passage = hit.passages[0]
-            self._show_citation(Citation(passage, passage.text.strip()[:130]))
+            if hit.passages:
+                passage = hit.passages[0]
+                self._show_citation(Citation(passage, passage.text.strip()[:130]))
+            else:
+                _add_item(
+                    self.results,
+                    f"{hit.file.name}\n{file_origin(hit.file)} · {hit.file.relative_path}",
+                    hit.file,
+                )
 
     def show_answer(self, result: Answer) -> None:
         self.clear_results()
@@ -298,6 +398,15 @@ class SettingsPage(QWidget):
         path = label(str(root), "Hint", wrap=True)
         path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         state.addWidget(path)
+        toggles = QHBoxLayout()
+        self.pause = QCheckBox("暂停后台索引")
+        self.pause.setObjectName("PauseMonitoring")
+        self.startup = QCheckBox("登录 Windows 时启动")
+        self.startup.setObjectName("StartWithWindows")
+        toggles.addWidget(self.pause)
+        toggles.addWidget(self.startup)
+        toggles.addStretch()
+        state.addLayout(toggles)
         self.open_button = button("打开数据目录", "OpenData")
         self.open_button.setProperty("primary", True)
         state.addLayout(_actions(self.open_button))
@@ -317,13 +426,30 @@ class SettingsPage(QWidget):
         return item.data(ROLE) if item is not None else None
 
     def show_tasks(self, files: list[FileRecord], sources: list[Source]) -> None:
+        selected = self.selected_task()
+        entries = [*sources, *files]
+        if self.tasks.count() == len(entries) and all(
+            self.tasks.item(i).data(ROLE) == item for i, item in enumerate(entries)
+        ):
+            return
         self.tasks.clear()
-        scan_state = {"ready": "扫描完成", "failed": "扫描不完整", "pending": "待扫描"}
+        scan_state = {
+            "ready": "持续跟踪",
+            "failed": "扫描不完整",
+            "pending": "待扫描",
+            "scanning": "正在扫描目录",
+            "indexing": "正在补建内容索引",
+        }
         for source in sources:
-            _add_item(self.tasks, f"{source.path}\n{scan_state[source.status]}", source)
+            item = _add_item(self.tasks, f"{source.path}\n{scan_state[source.status]}", source)
+            if isinstance(selected, Source) and source.id == selected.id:
+                self.tasks.setCurrentItem(item)
         for file in files:
-            if file.status != "ready":
-                _add_item(self.tasks, f"{file.name}\n{STATUS[file.status]} · {file.reason}", file)
+            item = _add_item(
+                self.tasks, f"{file.name}\n{STATUS[file.status]} · {file.reason}", file
+            )
+            if isinstance(selected, FileRecord) and file.id == selected.id:
+                self.tasks.setCurrentItem(item)
 
     def _update_actions(self) -> None:
         selected = self.selected_task()

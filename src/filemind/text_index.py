@@ -11,15 +11,16 @@ from pathlib import Path
 import jieba
 from tokenizers import BertWordPieceTokenizer
 
-from filemind.documents import Section, line_location
+from filemind.documents import EXTENSIONS, Section, line_location
 
 MAX_MODEL_TOKENS = 512
 PASSAGE_TOKENS = 384
 PASSAGE_OVERLAP = 48
 VOCAB_PATH = Path(__file__).with_name("resources") / "bge-vocab.txt"
+_SUFFIXES = "|".join(re.escape(ext) for ext in sorted(EXTENSIONS, key=len, reverse=True))
 _TECHNICAL = re.compile(
     r"[a-z][a-z0-9_]*(?:[+#]+|(?:/[a-z][a-z0-9_]*)+)"
-    r"|\.(?:pdf|docx|pptx|md|txt)(?![a-z0-9_])|[a-z0-9_]+",
+    rf"|(?:{_SUFFIXES})(?![a-z0-9_])|[a-z0-9_]+",
     re.IGNORECASE | re.ASCII,
 )
 _STOP_WORDS = frozenset(
@@ -58,6 +59,14 @@ def keyword_terms(text: str) -> Iterator[str]:
 
 def fts_query(query: str) -> str:
     return " OR ".join(list(dict.fromkeys(keyword_terms(query)))[:64])
+
+
+def catalog_terms(value: str) -> str:
+    separated = value.replace("/", " ").replace("\\", " ")
+    terms = list(keyword_terms(separated))
+    if "_" in separated:
+        terms.extend(keyword_terms(separated.replace("_", " ")))
+    return " ".join(dict.fromkeys(terms))
 
 
 def _ranges(text: str) -> Iterator[tuple[int, int]]:
