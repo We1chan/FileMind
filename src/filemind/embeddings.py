@@ -1,9 +1,11 @@
 """Opt-in weight installation and local BGE inference with ONNX Runtime."""
 
 import hashlib
+import heapq
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import closing
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -146,27 +148,45 @@ class SemanticIndex:
         return self.model
 
     def rank(
-        self, query: str, scope: SearchScope, cancelled: Callable[[], bool]
+        self,
+        query: str,
+        scope: SearchScope,
+        cancelled: Callable[[], bool],
+        *,
+        populate: bool = True,
     ) -> list[tuple[int, int]]:
         model = self._load()
-        while not cancelled() and (batch := self.store.embedding_inputs(FINGERPRINT, scope)):
-            vectors = self._embed(model, [text for _, text in batch])
-            self.store.set_embeddings(
-                FINGERPRINT,
-                [
-                    (vector.tobytes(), chunk_id)
-                    for (chunk_id, _), vector in zip(batch, vectors, strict=True)
-                ],
-            )
+        if populate:
+            while not cancelled() and self.populate_batch(scope):
+                pass
         if cancelled():
             return []
         target = self._embed(model, [_QUERY_PREFIX + query])[0]
-        scores = []
-        for file_id, chunk_id, encoded in self.store.embeddings(FINGERPRINT, scope):
-            vector = np.frombuffer(encoded, dtype="<f4", count=DIMENSIONS)
-            scores.append((-float(np.dot(target, vector)), chunk_id, file_id))
+
+        def scores() -> Iterator[tuple[float, int, int]]:
+            with closing(self.store.embeddings(FINGERPRINT, scope)) as rows:
+                for file_id, chunk_id, encoded in rows:
+                    if cancelled():
+                        return
+                    vector = np.frombuffer(encoded, dtype="<f4", count=DIMENSIONS)
+                    yield -float(np.dot(target, vector)), chunk_id, file_id
+
         self.error = ""
-        return [(file_id, chunk_id) for _, chunk_id, file_id in sorted(scores)]
+        return [(file_id, chunk_id) for _, chunk_id, file_id in heapq.nsmallest(3000, scores())]
+
+    def populate_batch(self, scope: SearchScope = SearchScope(content_only=True)) -> bool:
+        batch = self.store.embedding_inputs(FINGERPRINT, scope)
+        if not batch:
+            return False
+        vectors = self._embed(self._load(), [text for _, text in batch])
+        self.store.set_embeddings(
+            FINGERPRINT,
+            [
+                (vector.tobytes(), chunk_id)
+                for (chunk_id, _), vector in zip(batch, vectors, strict=True)
+            ],
+        )
+        return True
 
     def _embed(self, model: BgeModel, texts: list[str]) -> NDArray[np.float32]:
         try:

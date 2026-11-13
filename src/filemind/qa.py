@@ -3,7 +3,7 @@
 import json
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.client import HTTPException
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
@@ -160,10 +160,18 @@ class Questions:
         scope: SearchScope = SearchScope(),
         remote: RemoteSettings | None = None,
         cancelled: Callable[[], bool] = _continue,
+        *,
+        wait_for_vectors: bool = True,
     ) -> Answer:
         question = question.strip()[:MAX_QUERY_CHARS]
         result = self.search.find(
-            question, mode, scope, limit=MAX_EVIDENCE, passages_per_file=2, cancelled=cancelled
+            question,
+            "keyword" if mode == "filename" else mode,
+            replace(scope, content_only=True),
+            limit=MAX_EVIDENCE,
+            passages_per_file=2,
+            cancelled=cancelled,
+            wait_for_vectors=wait_for_vectors,
         )
         passages = [
             hit.passages[index]
