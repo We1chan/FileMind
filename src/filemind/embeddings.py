@@ -223,20 +223,31 @@ class SemanticIndex:
         self.error = ""
         return [(file_id, chunk_id) for _, chunk_id, file_id in heapq.nsmallest(3000, scores())]
 
-    def populate_batch(self, scope: SearchScope = SearchScope(content_only=True)) -> bool:
-        model = self._load()
-        batch = self.store.embedding_inputs(FINGERPRINT, scope, limit=32 if model.uses_gpu else 16)
-        if not batch:
+    def populate_batch(
+        self,
+        scope: SearchScope = SearchScope(content_only=True),
+        *,
+        batches: int = 1,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> bool:
+        if cancelled is not None and cancelled():
             return False
-        vectors = self._embed(model, [text for _, text in batch])
-        self.store.set_embeddings(
-            FINGERPRINT,
-            [
+        model = self._load()
+        batch_size = 32 if model.uses_gpu else 16
+        pending = self.store.embedding_inputs(FINGERPRINT, scope, limit=batch_size * batches)
+        encoded = []
+        for start in range(0, len(pending), batch_size):
+            if cancelled is not None and cancelled():
+                break
+            batch = pending[start : start + batch_size]
+            vectors = self._embed(model, [text for _, text in batch])
+            encoded.extend(
                 (vector.tobytes(), chunk_id)
                 for (chunk_id, _), vector in zip(batch, vectors, strict=True)
-            ],
-        )
-        return True
+            )
+        if encoded:
+            self.store.set_embeddings(FINGERPRINT, encoded)
+        return bool(encoded)
 
     def _embed(self, model: BgeModel, texts: list[str]) -> NDArray[np.float32]:
         try:

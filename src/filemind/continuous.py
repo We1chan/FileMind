@@ -22,6 +22,8 @@ RECONCILE_SECONDS = 600
 EVENT_SECONDS = 2
 WORK_SECONDS = 0.2
 INDEX_BATCH = 16
+EMBEDDING_BATCHES_PER_WRITE = 4
+CPU_EMBEDDING_SCAN_SECONDS = 8
 MAX_CHANGED_PATHS = 10_000
 
 
@@ -74,6 +76,9 @@ class ContinuousIndex:
         self._observer = Observer(timeout=0.5)
         self._watches = {}
         self._thread = Thread(target=self._run, name="FileMind index", daemon=True)
+        self._vector_thread = Thread(
+            target=self._run_embeddings, name="FileMind embeddings", daemon=True
+        )
         self.error = ""
 
     @property
@@ -83,6 +88,7 @@ class ContinuousIndex:
     def start(self) -> None:
         self._observer.start()
         self._thread.start()
+        self._vector_thread.start()
 
     def request_stop(self) -> None:
         self._closing.set()
@@ -91,6 +97,7 @@ class ContinuousIndex:
     def stop(self) -> None:
         self.request_stop()
         self._thread.join()
+        self._vector_thread.join()
         self._observer.stop()
         self._observer.join()
 
@@ -172,11 +179,8 @@ class ContinuousIndex:
             return trees, changes
 
     def _run(self) -> None:
-        semantic = self.semantic
         next_full = 0.0
-        retry_model_at = 0.0
         while not self._closing.is_set():
-            embedding_progress = False
             try:
                 sources = self.store.sources()
                 self._sync_watches(sources)
@@ -192,22 +196,6 @@ class ContinuousIndex:
                             next_full = monotonic() + RECONCILE_SECONDS
                         if full and self._cancelled() and not self._closing.is_set():
                             self._refresh.set()
-                        # Use a small share of the first scan for vectors so content does not stall.
-                        if (
-                            not self._cancelled()
-                            and monotonic() >= retry_model_at
-                            and semantic.path.is_file()
-                        ):
-                            try:
-                                for _ in range(1 if self._jobs else 4):
-                                    if self._cancelled() or not semantic.populate_batch():
-                                        break
-                                    embedding_progress = True
-                                retry_model_at = monotonic() + (
-                                    8 if self._jobs and not semantic.uses_gpu else 0
-                                )
-                            except ModelError:
-                                retry_model_at = monotonic() + 60
                         self.error = ""
                     finally:
                         self._writer.release()
@@ -215,10 +203,34 @@ class ContinuousIndex:
                 logging.getLogger(__name__).exception("Continuous indexing failed")
                 self.error = "后台索引暂时遇到错误，将自动重试。"
                 next_full = monotonic() + 15
-            busy = self._jobs or (embedding_progress and semantic.uses_gpu)
-            wait = WORK_SECONDS if busy and not self._cancelled() else EVENT_SECONDS
+            wait = WORK_SECONDS if self._jobs and not self._cancelled() else EVENT_SECONDS
             self._wake.wait(wait)
             self._wake.clear()
+
+    def _run_embeddings(self) -> None:
+        retry_model_at = 0.0
+        while not self._closing.is_set():
+            wait = EVENT_SECONDS
+            if (
+                not self._cancelled()
+                and monotonic() >= retry_model_at
+                and self.semantic.path.is_file()
+            ):
+                try:
+                    indexing_files = self._writer.locked() or bool(self._jobs)
+                    batches = EMBEDDING_BATCHES_PER_WRITE
+                    if indexing_files and not self.semantic.uses_gpu:
+                        batches = 1
+                    if self.semantic.populate_batch(batches=batches, cancelled=self._cancelled):
+                        if self.semantic.uses_gpu:
+                            continue
+                        if indexing_files:
+                            wait = CPU_EMBEDDING_SCAN_SECONDS
+                except ModelError:
+                    retry_model_at = monotonic() + 60
+                except Exception:
+                    logging.getLogger(__name__).exception("Background embedding failed")
+            self._closing.wait(wait)
 
     def _update(self, sources: list[Source], full: bool) -> None:
         trees, changes = self._drain()

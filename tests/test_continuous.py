@@ -1,13 +1,16 @@
 import os
 import shutil
 from pathlib import Path
+from threading import Event
 from time import monotonic, sleep
 from zipfile import ZipFile
 
+import numpy as np
 import pytest
 from xlsxwriter import Workbook
 
 from filemind.continuous import ContinuousIndex
+from filemind.embeddings import DIMENSIONS, FINGERPRINT
 from filemind.library import Library
 from filemind.qa import Questions
 from filemind.search import Search
@@ -150,4 +153,43 @@ def test_watcher_handles_new_changed_moved_and_deleted_text_without_refresh(
         service.pause(False)
         wait_for(lambda: bool(search.find("PausedWatcherNeedle", "keyword").hits))
     finally:
+        service.stop()
+
+
+def test_embeddings_are_committed_during_a_directory_scan(
+    library: Library, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scan_started = Event()
+    release_scan = Event()
+
+    def scan_in_progress(*args: object) -> None:
+        scan_started.set()
+        release_scan.wait()
+
+    class Model:
+        uses_gpu = True
+
+        def embed(self, texts: list[str]) -> np.ndarray:
+            assert scan_started.wait(5)
+            return np.ones((len(texts), DIMENSIONS), dtype="<f4")
+
+    note = tmp_path / "notes.txt"
+    note.write_text(
+        "".join(f"Sample {index}\n" + "\n" * 47 for index in range(65)), encoding="utf-8"
+    )
+    library.import_files([note])
+    library.paths.model.parent.mkdir(parents=True, exist_ok=True)
+    library.paths.model.touch()
+    monkeypatch.setattr("filemind.embeddings.BgeModel", lambda _: Model())
+    service = ContinuousIndex(library)
+    monkeypatch.setattr(service, "_update", scan_in_progress)
+    scope = SearchScope(content_only=True)
+    assert len(library.store.embedding_inputs(FINGERPRINT, scope, limit=100)) == 65
+
+    service.start()
+    try:
+        assert scan_started.wait(5)
+        wait_for(lambda: len(list(library.store.embeddings(FINGERPRINT, scope))) == 65)
+    finally:
+        release_scan.set()
         service.stop()
