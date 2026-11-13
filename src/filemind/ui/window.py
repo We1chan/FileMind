@@ -226,11 +226,25 @@ class MainWindow(QMainWindow):
         ):
             self.reveal()
 
-    def reveal(self) -> None:
-        self.showNormal()
+    def reveal(self) -> bool:
+        if self.closing:
+            return False
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.show()
+        if QApplication.platformName() == "windows":
+            from win32con import SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW
+            from win32gui import IsWindowVisible, SetWindowPos
+
+            handle = int(self.winId())
+            # A hidden Windows launch can suppress Qt's first ShowWindow call.
+            if not IsWindowVisible(handle):
+                flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW
+                SetWindowPos(handle, 0, 0, 0, 0, 0, flags)
+            if not IsWindowVisible(handle):
+                return False
         self.raise_()
         self.activateWindow()
-        self._reload_library()
+        return self.isVisible()
 
     def quit(self) -> None:
         self.closing = True

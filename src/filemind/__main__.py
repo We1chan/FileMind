@@ -143,8 +143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             def receive(peer: QLocalSocket = socket) -> None:
                 if bytes(peer.readAll()) != b"show":
                     return
-                window.reveal()
-                peer.write(b"ok")
+                peer.write(b"ok" if window.reveal() else b"unavailable")
                 peer.flush()
                 peer.disconnectFromServer()
 
@@ -160,7 +159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if window.tray is not None:
         app.setQuitOnLastWindowClosed(False)
     if not args.tray or window.tray is None:
-        window.show()
+        window.reveal()
     app.commitDataRequest.connect(lambda _: window.quit())
     result = app.exec()
     window.shutdown()

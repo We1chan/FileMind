@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -108,6 +110,51 @@ def close_window(window: MainWindow) -> None:
     wait_for_task(window)
     window.deleteLater()
     QApplication.sendPostedEvents(window, QEvent.Type.DeferredDelete)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows startup visibility")
+def test_tray_activation_shows_the_native_window_after_hidden_launch(tmp_path: Path) -> None:
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = subprocess.SW_HIDE
+    program = """
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import QEvent
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon
+from win32gui import IsWindowVisible
+
+from filemind.config import AppPaths
+from filemind.storage import LocalStore
+from filemind.ui.window import MainWindow
+
+app = QApplication([])
+paths = AppPaths.resolve(Path(sys.argv[1]))
+paths.prepare()
+store = LocalStore(paths.database)
+window = MainWindow(paths, store, store.initialize())
+try:
+    assert not window.isVisible()
+    window._tray_activated(QSystemTrayIcon.ActivationReason.Trigger)
+    app.processEvents()
+    assert IsWindowVisible(int(window.winId())), "FileMind window is hidden at the Win32 level"
+finally:
+    window.close()
+    window.deleteLater()
+    app.sendPostedEvents(window, QEvent.Type.DeferredDelete)
+"""
+    run = subprocess.run(
+        [sys.executable, "-c", program, str(tmp_path / "app")],
+        startupinfo=startup,
+        env=dict(os.environ, QT_QPA_PLATFORM="windows"),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
 
 
 def test_desktop_import_search_and_open_citation(
