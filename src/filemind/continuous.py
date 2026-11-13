@@ -190,15 +190,17 @@ class ContinuousIndex:
                             next_full = monotonic() + RECONCILE_SECONDS
                         if full and self._cancelled() and not self._closing.is_set():
                             self._refresh.set()
+                        # Use a small share of the first scan for vectors so content does not stall.
                         if (
                             not self._cancelled()
                             and monotonic() >= retry_model_at
                             and semantic.path.is_file()
                         ):
                             try:
-                                for _ in range(2):
+                                for _ in range(1 if self._jobs else 2):
                                     if self._cancelled() or not semantic.populate_batch():
                                         break
+                                retry_model_at = monotonic() + (8 if self._jobs else 0)
                             except ModelError:
                                 retry_model_at = monotonic() + 60
                         self.error = ""
