@@ -165,6 +165,12 @@ class SearchScope:
         return " AND ".join(conditions), parameters
 
 
+@dataclass(slots=True)
+class _VectorChanges:
+    deleted: bool = False
+    updated: tuple[int, ...] = ()
+
+
 def _file(row: sqlite3.Row) -> FileRecord:
     columns = set(row.keys())
     return FileRecord(
@@ -211,7 +217,7 @@ class LocalStore:
             }
 
     def initialize(self) -> StorageStatus:
-        with self._session(vectors=True) as connection:
+        with self._session() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("BEGIN IMMEDIATE")
             schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
@@ -348,7 +354,12 @@ class LocalStore:
             )
 
     def remove_source(self, source_id: int) -> None:
-        with self._session(vectors=True) as connection:
+        changes = _VectorChanges()
+        with self._session(vector_changes=changes) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changes.deleted = self._has_vectors(
+                connection, "SELECT id FROM files WHERE source_id = ?", (source_id,)
+            )
             if self.fts5_available:
                 connection.execute(
                     "DELETE FROM file_catalog WHERE rowid IN (SELECT id FROM files WHERE source_id = ?)",
@@ -368,13 +379,15 @@ class LocalStore:
     def remove_linked_files(self, file_ids: list[int]) -> None:
         if not file_ids:
             return
-        with self._session(vectors=True) as connection:
+        changes = _VectorChanges()
+        with self._session(vector_changes=changes) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("CREATE TEMP TABLE excluded_files (id INTEGER PRIMARY KEY)")
             connection.executemany(
                 "INSERT INTO excluded_files SELECT id FROM files WHERE id = ? AND source_id IS NOT NULL",
                 ((file_id,) for file_id in file_ids),
             )
+            changes.deleted = self._has_vectors(connection, "SELECT id FROM excluded_files")
             if self.fts5_available:
                 connection.execute("DELETE FROM file_catalog WHERE rowid IN excluded_files")
                 connection.execute(
@@ -536,9 +549,10 @@ class LocalStore:
             )
 
     def unavailable(self, file_id: int, status: str, reason: str) -> None:
-        with self._session(vectors=True) as connection:
+        changes = _VectorChanges()
+        with self._session(vector_changes=changes) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            self._delete_sections(connection, file_id)
+            changes.deleted = self._delete_sections(connection, file_id)
             connection.execute(
                 """UPDATE files SET status = ?, reason = ?, sha256 = NULL, size = NULL,
                 modified_ns = NULL, changed_ns = NULL, identity = NULL WHERE id = ?""",
@@ -560,9 +574,10 @@ class LocalStore:
         *,
         parser_version: int = 0,
     ) -> int:
-        with self._session(vectors=True) as connection:
+        changes = _VectorChanges()
+        with self._session(vector_changes=changes) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            self._delete_sections(connection, file_id)
+            changes.deleted = self._delete_sections(connection, file_id)
             return connection.execute(
                 """UPDATE files SET
                 version = version + (sha256 IS NOT ? OR ? IS NULL OR parser_version != ?),
@@ -612,7 +627,21 @@ class LocalStore:
                             (chunk_id, name_terms, chunk.terms),
                         )
 
-    def _delete_sections(self, connection: sqlite3.Connection, file_id: int) -> None:
+    @staticmethod
+    def _has_vectors(
+        connection: sqlite3.Connection, file_ids_sql: str, parameters: tuple[int, ...] = ()
+    ) -> bool:
+        return (
+            connection.execute(
+                f"""SELECT 1 FROM sections s JOIN chunks c ON c.section_id = s.id
+            WHERE s.file_id IN ({file_ids_sql}) AND c.vector IS NOT NULL LIMIT 1""",
+                parameters,
+            ).fetchone()
+            is not None
+        )
+
+    def _delete_sections(self, connection: sqlite3.Connection, file_id: int) -> bool:
+        had_vectors = self._has_vectors(connection, "?", (file_id,))
         if self.fts5_available:
             connection.execute(
                 """DELETE FROM chunk_fts WHERE rowid IN (
@@ -623,6 +652,7 @@ class LocalStore:
         else:
             connection.execute("INSERT OR IGNORE INTO preferences VALUES ('fts5_dirty', '1')")
         connection.execute("DELETE FROM sections WHERE file_id = ?", (file_id,))
+        return had_vectors
 
     def passage(self, chunk_id: int, version: int) -> Passage | None:
         with self._session() as connection:
@@ -664,19 +694,28 @@ class LocalStore:
         if not self.fts5_available or not query:
             return []
         clause, parameters = scope.clause()
-        if terms:
-            fields = "' ' || c.name_terms || ' ' || c.body_terms || ' '"
-            coverage = " + ".join(f"(instr({fields}, ?) > 0)" for _ in terms)
-            clause += f" AND ({coverage}) >= 2"
-            parameters.extend(f" {term} " for term in terms)
+        ranked = f"""SELECT f.id AS file_id, c.id AS chunk_id, bm25(chunk_fts, 3.0, 1.0) AS score
+            {_PASSAGES} JOIN chunk_fts ON chunk_fts.rowid = c.id
+            WHERE chunk_fts MATCH ? AND {clause} ORDER BY score, c.id LIMIT ?"""
+        values = (query, *parameters, budget)
         with self._session() as connection:
+            if not terms:
+                return [
+                    (row["file_id"], row["chunk_id"]) for row in connection.execute(ranked, values)
+                ]
+            # Check coverage only on the scoped BM25 shortlist.
+            rows = connection.execute(
+                f"""WITH ranked AS MATERIALIZED ({ranked})
+                SELECT r.file_id, r.chunk_id, c.name_terms, c.body_terms
+                FROM ranked r JOIN chunks c ON c.id = r.chunk_id ORDER BY r.score, r.chunk_id""",
+                values,
+            )
+            query_terms = set(terms)
+            minimum = (len(query_terms) + 1) // 2
             return [
-                tuple(row)
-                for row in connection.execute(
-                    f"""SELECT f.id, c.id {_PASSAGES} JOIN chunk_fts ON chunk_fts.rowid = c.id
-                WHERE chunk_fts MATCH ? AND {clause} ORDER BY bm25(chunk_fts, 3.0, 1.0), c.id LIMIT ?""",
-                    (query, *parameters, budget),
-                )
+                (file_id, chunk_id)
+                for file_id, chunk_id, name, body in rows
+                if len(query_terms.intersection((name + " " + body).split())) >= minimum
             ]
 
     def catalog_ranks(self, query: str, scope: SearchScope, budget: int = 600) -> list[int]:
@@ -745,9 +784,8 @@ class LocalStore:
             ]
 
     def set_embeddings(self, fingerprint: str, vectors: list[tuple[bytes, int]]) -> None:
-        with self._session(
-            vectors=True, updated_chunks=tuple(row[1] for row in vectors)
-        ) as connection:
+        changes = _VectorChanges(updated=tuple(chunk_id for _, chunk_id in vectors))
+        with self._session(vector_changes=changes) as connection:
             connection.executemany(
                 "UPDATE chunks SET model_fingerprint = ?, vector = ? WHERE id = ?",
                 ((fingerprint, vector, chunk_id) for vector, chunk_id in vectors),
@@ -795,7 +833,7 @@ class LocalStore:
 
     @contextmanager
     def _session(
-        self, *, vectors: bool = False, updated_chunks: tuple[int, ...] = ()
+        self, *, vector_changes: _VectorChanges | None = None
     ) -> Iterator[sqlite3.Connection]:
         with closing(sqlite3.connect(self.database_path, timeout=3.0)) as connection:
             connection.row_factory = sqlite3.Row
@@ -803,11 +841,17 @@ class LocalStore:
             connection.execute("PRAGMA temp_store = MEMORY")
             with connection:
                 yield connection
-                if vectors and connection.total_changes:
+                if (
+                    vector_changes is not None
+                    and (vector_changes.deleted or vector_changes.updated)
+                    and connection.total_changes
+                ):
                     with self._change_lock:
                         connection.commit()
                         self._vector_revision += 1
-                        if updated_chunks:
-                            self._vector_updates.append((self._vector_revision, updated_chunks))
-                        else:
+                        if vector_changes.deleted:
                             self._vector_updates.clear()
+                        else:
+                            self._vector_updates.append(
+                                (self._vector_revision, vector_changes.updated)
+                            )

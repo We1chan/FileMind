@@ -240,6 +240,21 @@ def test_search_lists_empty_files_separately(library: Library, tmp_path: Path, m
     assert all(hit.copies == 1 for hit in hits)
 
 
+def test_keyword_relaxation_requires_enough_terms_in_one_passage(
+    library: Library, tmp_path: Path
+) -> None:
+    weak, relevant = tmp_path / "weak.txt", tmp_path / "relevant.txt"
+    weak.write_text("alpha bravo", encoding="utf-8")
+    relevant.write_text("alpha bravo charlie", encoding="utf-8")
+    library.import_files([weak, relevant])
+
+    search = Search(library)
+    assert not search.find("alpha bravo delta echo foxtrot", "keyword").hits
+    assert not search.find("alpha delta", "keyword").hits
+    hits = search.find("alpha bravo charlie delta echo", "keyword").hits
+    assert [hit.file.name for hit in hits] == [relevant.name]
+
+
 def test_retries_a_failed_parse_and_uses_actual_wordpiece_boundaries(
     library: Library, tmp_path: Path
 ) -> None:

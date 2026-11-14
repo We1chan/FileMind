@@ -64,7 +64,8 @@ uv build --no-sources
 
 ### 检索与问答
 
-- `Search.find` 的 `filename` 模式按名称与路径返回各文件。关键词分支用 FTS5 BM25 优先查找全词项命中，再放宽查询，并合并 `file_catalog` 的名称和路径命中。语义分支使用缓存的向量矩阵，按余弦相似度排序并过滤低于 0.53 的候选。两路聚合后按非空文件的 SHA-256 折叠，`hybrid` 再做 RRF（k=60）。返回前用 `library.metadata_current` 或 `catalog_current` 复核候选文件。缺少模型时降级为关键词检索并提示「语义检索未启用」。
+- `Search.find` 的 `filename` 模式按名称与路径返回各文件。关键词用 FTS5 BM25 优先查找全词项命中。三个及以上词项的查询可放宽，在 BM25 候选中保留同一块覆盖至少一半词项的结果。合并 `file_catalog` 的名称和路径命中后，关键词与语义按非空文件的 SHA-256 折叠，`hybrid` 再做 RRF（k=60）。返回前用 `library.metadata_current` 或 `catalog_current` 复核候选文件。缺少模型时降级为关键词检索并提示「语义检索未启用」。
+- `SemanticIndex` 按余弦相似度排序并过滤低于 0.53 的候选，按检索范围缓存向量矩阵。新增向量可增量载入，索引无向量的文件继续复用缓存，删除带向量的块会触发重新读取。
 - `embeddings.BgeModel` 加载前校验权重大小和 SHA-256。Windows x64 优先使用 DirectML（依赖 `onnxruntime-directml`），失败时回退 CPU。
 - `qa.Questions.ask` 先在限定范围内检索证据。没有远程配置或未启用时，直接返回带位置的原文摘录。远程请求禁止重定向，最多发送 6 条摘录、每条不超过 900 字符。`_validate` 逐条核对返回引用的块 ID、版本和逐字摘录，任一失败都回退为摘录。
 
