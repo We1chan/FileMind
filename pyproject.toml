@@ -1,10 +1,22 @@
 [project]
 name = "filemind"
-version = "0.1.0.dev1"
+version = "0.1.0.dev3"
 description = "Windows 桌面个人文件智能管理系统"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = ["PySide6-Essentials>=6.12,<6.13"]
+dependencies = [
+    "defusedxml>=0.7,<1",
+    "jieba>=0.42.1,<0.43",
+    "numpy>=2,<3",
+    "onnxruntime>=1.22,<2 ; sys_platform != 'win32' or platform_machine != 'AMD64'",
+    "onnxruntime-directml>=1.24.4,<2 ; sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "pypdf>=7,<8",
+    "PySide6-Essentials>=6.12,<6.13",
+    "python-calamine>=0.4,<1",
+    "pywin32>=308 ; sys_platform == 'win32'",
+    "tokenizers>=0.21,<1",
+    "watchdog>=6,<7",
+]
 
 [project.gui-scripts]
 filemind = "filemind.__main__:main"
@@ -12,6 +24,8 @@ filemind = "filemind.__main__:main"
 [dependency-groups]
 dev = [
     "pytest>=8.4,<10",
+    "python-docx>=1.2,<2",
+    "python-pptx>=1,<2",
     "ruff>=0.12,<1",
 ]
 
@@ -19,10 +33,16 @@ dev = [
 requires = ["uv_build>=0.11.21,<0.12"]
 build-backend = "uv_build"
 
+[tool.uv]
+cache-dir = "data/cache/uv"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
+cache_dir = "data/cache/pytest"
 
 [tool.ruff]
+cache-dir = "data/cache/ruff"
 line-length = 100
 target-version = "py312"
 

@@ -1,0 +1,462 @@
+"""Extract plain text and locations from an immutable file snapshot."""
+
+import codecs
+import json
+import os
+import posixpath
+import subprocess
+import sys
+import tempfile
+from collections.abc import Callable, Iterator
+from dataclasses import asdict, dataclass, replace
+from io import BytesIO
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+from xml.etree.ElementTree import Element
+from zipfile import ZipFile
+
+from defusedxml.ElementTree import fromstring
+
+WORD_EXTENSIONS = (".docx", ".docm")
+SLIDE_EXTENSIONS = (".pptx", ".pptm")
+LEGACY_OFFICE_EXTENSIONS = (".doc", ".ppt")
+SHEET_EXTENSIONS = (".xlsx", ".xls", ".xlsm", ".xlsb")
+ARCHIVE_EXTENSIONS = (".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz", ".tar.xz", ".tar.bz2")
+TEXT_EXTENSIONS = (
+    ".pdf",
+    *WORD_EXTENSIONS,
+    *SLIDE_EXTENSIONS,
+    *SHEET_EXTENSIONS,
+    *LEGACY_OFFICE_EXTENSIONS,
+    ".md",
+    ".txt",
+)
+EXTENSIONS = (*TEXT_EXTENSIONS, *ARCHIVE_EXTENSIONS, ".exe")
+MAX_FILE_BYTES = 32 * 1024 * 1024
+MAX_TEXT_CHARS = 2_000_000
+MAX_SECTIONS = 20_000
+MAX_XML_BYTES = 8 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
+MAX_PAGES = 1_000
+OFFICE_GROUP_CHARS = 320
+_INVALID_UNICODE = dict.fromkeys(range(0xD800, 0xE000), "\ufffd")
+
+
+class DocumentError(ValueError):
+    """A file cannot be indexed."""
+
+
+@dataclass(frozen=True, slots=True)
+class Section:
+    location: str
+    text: str
+    first_line: int | None = None
+    heading: str = ""
+
+
+def file_extension(path: Path) -> str:
+    suffixes = "".join(path.suffixes[-2:]).lower()
+    return suffixes if suffixes in ARCHIVE_EXTENSIONS else path.suffix.lower()
+
+
+def parse_document(data: bytes, extension: str, *, temp_dir: Path) -> list[Section]:
+    if len(data) > MAX_FILE_BYTES:
+        raise DocumentError("文件超过 32 MiB。")
+    if extension in (".md", ".txt"):
+        return _collect(_text_sections(data))
+    if extension not in TEXT_EXTENSIONS:
+        raise DocumentError("不支持此文件格式。")
+
+    executable = Path(sys.executable)
+    if executable.stem.lower() == "pythonw":
+        executable = executable.with_name("python.exe")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    directory = str(temp_dir)
+    try:
+        process = subprocess.run(
+            [str(executable), "-m", "filemind.documents", extension],
+            input=data,
+            capture_output=True,
+            env=dict(os.environ, TMP=directory, TEMP=directory, TMPDIR=directory),
+            timeout=25,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise DocumentError("解析超过 25 秒。") from error
+    if process.returncode:
+        raise DocumentError("无法解析文件。请检查文件格式及完整性。")
+    result = json.loads(process.stdout)
+    if "error" in result:
+        raise DocumentError(result["error"])
+    return [Section(**item) for item in result["sections"]]
+
+
+def _text_sections(data: bytes) -> Iterator[Section]:
+    try:
+        if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+            content = data.decode("utf-16")
+        else:
+            try:
+                content = data.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                content = data.decode("gb18030")
+    except UnicodeError as error:
+        raise DocumentError(
+            "无法识别文本编码。请使用 UTF-8、带 BOM 的 UTF-16 或 GB18030。"
+        ) from error
+    if "\0" in content:
+        raise DocumentError("文件包含二进制数据。")
+    if len(content) > MAX_TEXT_CHARS:
+        raise DocumentError("提取的文本超过 200 万字符。")
+    lines = content.splitlines(keepends=True)
+    for start in range(0, len(lines), 48):
+        end = min(start + 48, len(lines))
+        yield Section(line_location(start + 1, end), "".join(lines[start:end]), start + 1)
+
+
+def line_location(first: int, last: int) -> str:
+    return f"第 {first} 行" if first == last else f"第 {first}–{last} 行"
+
+
+def _collect(sections: Iterator[Section]) -> list[Section]:
+    result = []
+    chars = 0
+    for section in sections:
+        if not section.text.strip():
+            continue
+        chars += len(section.text)
+        if chars > MAX_TEXT_CHARS or len(result) >= MAX_SECTIONS:
+            raise DocumentError("提取的文本或段落数量超过上限。")
+        # Some PDF fonts emit unpaired UTF-16 surrogates in extracted text.
+        result.append(
+            replace(
+                section,
+                location=section.location.translate(_INVALID_UNICODE),
+                text=section.text.translate(_INVALID_UNICODE),
+            )
+        )
+    return result
+
+
+def _pdf_sections(data: bytes) -> Iterator[Section]:
+    from pypdf import PdfReader, apply_configuration
+
+    with apply_configuration(
+        maximum_declared_stream_length=MAX_FILE_BYTES,
+        array_based_stream_maximum_output_length=MAX_ARCHIVE_BYTES,
+        zlib_maximum_output_length=MAX_XML_BYTES,
+        lzw_maximum_output_length=MAX_XML_BYTES,
+        run_length_maximum_output_length=MAX_XML_BYTES,
+        stream_decoding_work_maximum_length=MAX_ARCHIVE_BYTES,
+        page_tree_maximum_entries=MAX_PAGES * 4,
+    ):
+        reader = PdfReader(BytesIO(data))
+        if reader.is_encrypted:
+            raise DocumentError("PDF 已加密。请导入解密后的副本。")
+        if len(reader.pages) > MAX_PAGES:
+            raise DocumentError("PDF 超过 1000 页。")
+        stream_bytes = 0
+        for number, page in enumerate(reader.pages, 1):
+            contents = page.get_contents()
+            page_bytes = len(contents.get_data()) if contents else 0
+            stream_bytes += page_bytes
+            if page_bytes > MAX_XML_BYTES or stream_bytes > MAX_ARCHIVE_BYTES:
+                raise DocumentError("PDF 解压后的内容超过解析上限。")
+            yield Section(f"第 {number} 页", page.extract_text())
+
+
+def _xml(archive: ZipFile, part: str) -> Element:
+    with archive.open(part) as stream:
+        data = stream.read(MAX_XML_BYTES + 1)
+    if len(data) > MAX_XML_BYTES:
+        raise DocumentError("Office 文件的单个 XML 部件超过 8 MiB。")
+    return fromstring(data, forbid_dtd=True)
+
+
+def _part_path(base: str, target: str) -> str:
+    url = urlsplit(target)
+    target_path = unquote(url.path)
+    if url.scheme or url.netloc or "\\" in target_path or not target_path:
+        raise DocumentError("Office 文件包含无效的部件引用。")
+    path = posixpath.normpath(
+        target_path[1:] if target_path.startswith("/") else posixpath.join(base, target_path)
+    )
+    if path in (".", "..") or path.startswith(("../", "/")):
+        raise DocumentError("Office 文件包含无效的部件引用。")
+    return path
+
+
+def _office_part(archive: ZipFile) -> str:
+    for rel in _xml(archive, "_rels/.rels"):
+        if rel.get("Type", "").endswith("/officeDocument") and rel.get("TargetMode") != "External":
+            return _part_path("", rel.attrib["Target"])
+    raise DocumentError("Office 文件缺少正文。")
+
+
+def _local(element: Element) -> str:
+    return element.tag.rsplit("}", 1)[-1]
+
+
+def _attribute(element: Element, name: str, default: str = "") -> str:
+    return next((v for k, v in element.attrib.items() if k.rsplit("}", 1)[-1] == name), default)
+
+
+def _paragraph_text(paragraph: Element) -> str:
+    parts = []
+    for element in paragraph.iter():
+        name = _local(element)
+        if name == "t":
+            parts.append(element.text or "")
+        elif name in ("br", "cr"):
+            parts.append("\n")
+        elif name == "tab":
+            parts.append("\t")
+    return "".join(parts)
+
+
+def _word_blocks(container: Element) -> Iterator[Element]:
+    for element in container:
+        name = _local(element)
+        if name in ("p", "tbl"):
+            yield element
+        elif name in ("sdt", "sdtContent", "customXml", "ins"):
+            yield from _word_blocks(element)
+
+
+def _word_sections(container: Element, prefix: str = "", heading: str = "") -> Iterator[Section]:
+    paragraphs = tables = 0
+    pending: list[tuple[int, str]] = []
+
+    def flush() -> Iterator[Section]:
+        yield from _row_sections(
+            iter(pending),
+            lambda first, last: _office_place(prefix, first, last, "段"),
+            heading=heading,
+        )
+        pending.clear()
+
+    for element in _word_blocks(container):
+        if _local(element) == "p":
+            paragraphs += 1
+            style = element.find("{*}pPr/{*}pStyle")
+            is_heading = style is not None and _attribute(style, "val").lower().startswith(
+                ("heading", "title", "标题")
+            )
+            location = f"{prefix}第 {paragraphs} 段"
+            value = _paragraph_text(element)
+            if is_heading:
+                yield from flush()
+                yield Section(f"{location}（标题）", value)
+                if value.strip():
+                    heading = value.strip()
+            elif value.strip():
+                pending.append((paragraphs, value))
+            continue
+
+        yield from flush()
+        tables += 1
+        for row_number, row in enumerate(element.findall("{*}tr"), 1):
+            column = 1
+            cells = []
+            for cell in row.findall("{*}tc"):
+                place = f"{prefix}表 {tables} · 第 {row_number} 行第 {column} 列 · "
+                cells.extend(
+                    section
+                    for section in _word_sections(cell, place, heading)
+                    if section.text.strip()
+                )
+                span = cell.find("{*}tcPr/{*}gridSpan")
+                column += max(1, int(_attribute(span, "val", "1"))) if span is not None else 1
+            if (
+                len(cells) > 1
+                and sum(len(section.text) + 1 for section in cells) <= OFFICE_GROUP_CHARS
+                and all("（标题）" not in section.location for section in cells)
+            ):
+                yield Section(
+                    f"{prefix}表 {tables} · 第 {row_number} 行",
+                    "\t".join(section.text for section in cells),
+                    heading=heading,
+                )
+            else:
+                yield from cells
+    yield from flush()
+
+
+def _slides(archive: ZipFile, part: str, root: Element) -> Iterator[Section]:
+    slides = root.findall("{*}sldIdLst/{*}sldId")
+    if not slides:
+        return
+    if len(slides) > MAX_PAGES:
+        raise DocumentError("PPTX 超过 1000 张幻灯片。")
+    base, filename = posixpath.split(part)
+    rels = _xml(archive, posixpath.join(base, "_rels", f"{filename}.rels"))
+    by_id = {
+        rel.attrib["Id"]: rel.attrib["Target"]
+        for rel in rels
+        if rel.get("Type", "").endswith("/slide") and rel.get("TargetMode") != "External"
+    }
+    for number, slide in enumerate(slides, 1):
+        rel_id = next(key for key in slide.attrib if key.endswith("}id"))
+        content = _xml(archive, _part_path(base, by_id[slide.attrib[rel_id]]))
+        shape_tree = content.find("{*}cSld/{*}spTree")
+        if shape_tree is not None:
+            paragraphs = (_paragraph_text(p) for p in shape_tree.iterfind(".//{*}p"))
+            yield Section(f"第 {number} 张幻灯片", "\n".join(paragraphs))
+
+
+def _office_sections(data: bytes, extension: str) -> Iterator[Section]:
+    with ZipFile(BytesIO(data)) as archive:
+        _check_office_parts(archive)
+        part = _office_part(archive)
+        root = _xml(archive, part)
+        if extension in WORD_EXTENSIONS:
+            body = root.find("{*}body")
+            if body is None:
+                raise DocumentError("DOCX 文件缺少正文。")
+            yield from _word_sections(body)
+        else:
+            yield from _slides(archive, part, root)
+
+
+def _check_office_parts(archive: ZipFile) -> None:
+    entries = archive.infolist()
+    if len(entries) > 5_000 or sum(entry.file_size for entry in entries) > MAX_ARCHIVE_BYTES:
+        raise DocumentError("Office 文件的部件数量或解压体积超过上限。")
+
+
+def _office_place(prefix: str, first: int, last: int, unit: str) -> str:
+    number = str(first) if first == last else f"{first}–{last}"
+    return f"{prefix}第 {number} {unit}"
+
+
+def _row_sections(
+    rows: Iterator[tuple[int, str]], locate: Callable[[int, int], str], *, heading: str = ""
+) -> Iterator[Section]:
+    pending: list[tuple[int, str]] = []
+
+    def flush() -> Iterator[Section]:
+        if pending:
+            first, last = pending[0][0], pending[-1][0]
+            yield Section(
+                locate(first, last), "\n".join(text for _, text in pending), heading=heading
+            )
+            pending.clear()
+
+    for number, value in rows:
+        if pending and (
+            number != pending[-1][0] + 1
+            or len(value) + sum(len(text) + 1 for _, text in pending) > OFFICE_GROUP_CHARS
+            or len(pending) >= 6
+        ):
+            yield from flush()
+        pending.append((number, value))
+    yield from flush()
+
+
+def _sheet_sections(data: bytes) -> Iterator[Section]:
+    from python_calamine import CalamineWorkbook
+
+    if data.startswith(b"PK"):
+        with ZipFile(BytesIO(data)) as archive:
+            _check_office_parts(archive)
+    with CalamineWorkbook.from_filelike(BytesIO(data)) as book:
+        for name in book.sheet_names:
+            sheet = book.get_sheet_by_name(name)
+            if sheet.start is None:
+                continue
+            if sheet.width * sheet.height > 500_000:
+                raise DocumentError("Excel 工作表的单元格范围超过解析上限。")
+            rows = (
+                (number, "\t".join(str(cell) for cell in cells if cell != ""))
+                for number, cells in enumerate(sheet.to_python(), sheet.start[0] + 1)
+            )
+            yield from _row_sections(
+                ((number, value) for number, value in rows if value),
+                lambda first, last: _office_place(f"工作表「{name}」· ", first, last, "行"),
+                heading=name,
+            )
+
+
+def _legacy_office_sections(data: bytes, extension: str) -> Iterator[tuple[int, str]]:
+    if os.name != "nt":
+        raise DocumentError("旧版 Word 或 PowerPoint 需要 Windows 文档筛选器。")
+    if not data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        raise DocumentError("旧版 Office 文件缺少有效的复合文档头。")
+
+    import pythoncom
+    from win32com.ifilter import ifilter
+
+    with tempfile.TemporaryDirectory(prefix="filemind-office-") as directory:
+        snapshot = Path(directory) / f"source{extension}"
+        snapshot.write_bytes(data)
+        reader = None
+        total = 0
+        try:
+            reader = ifilter.LoadIFilter(str(snapshot))
+            reader.Init(
+                ifilter.IFILTER_INIT_INDEXING_ONLY | ifilter.IFILTER_INIT_APPLY_INDEX_ATTRIBUTES
+            )
+            while True:
+                try:
+                    chunk, _, flags, *_ = reader.GetChunk()
+                except pythoncom.com_error as error:
+                    if error.hresult == ifilter.FILTER_E_END_OF_CHUNKS:
+                        break
+                    raise
+                if not flags & ifilter.CHUNK_TEXT:
+                    continue
+                parts = []
+                while True:
+                    try:
+                        part = reader.GetText(8192)
+                    except pythoncom.com_error as error:
+                        if error.hresult in (
+                            ifilter.FILTER_E_NO_TEXT,
+                            ifilter.FILTER_E_NO_MORE_TEXT,
+                        ):
+                            break
+                        raise
+                    if not part:
+                        break
+                    part = part.replace("\0", "")
+                    total += len(part)
+                    if total > MAX_TEXT_CHARS:
+                        raise DocumentError("提取的文本超过 200 万字符。")
+                    parts.append(part)
+                if parts:
+                    yield chunk, "".join(parts)
+        except pythoncom.com_error as error:
+            raise DocumentError("Windows 筛选器无法提取此旧版 Office 文件的正文。") from error
+        finally:
+            del reader
+
+
+def _parser_main() -> None:
+    try:
+        data = sys.stdin.buffer.read(MAX_FILE_BYTES + 1)
+        if len(data) > MAX_FILE_BYTES:
+            raise DocumentError("文件超过 32 MiB。")
+        extension = sys.argv[1]
+        if extension == ".pdf":
+            sections = _pdf_sections(data)
+        elif extension in SHEET_EXTENSIONS:
+            sections = _sheet_sections(data)
+        elif extension in LEGACY_OFFICE_EXTENSIONS:
+            sections = _row_sections(
+                _legacy_office_sections(data, extension),
+                lambda first, last: (
+                    f"正文片段 {first}" if first == last else f"正文片段 {first}–{last}"
+                ),
+            )
+        else:
+            sections = _office_sections(data, extension)
+        result = {"sections": [asdict(item) for item in _collect(sections)]}
+    except DocumentError as error:
+        result = {"error": str(error)}
+    except Exception:
+        result = {"error": "无法解析文件。请检查文件格式及完整性。"}
+    sys.stdout.buffer.write(json.dumps(result, ensure_ascii=True).encode("ascii"))
+
+
+if __name__ == "__main__":
+    _parser_main()
