@@ -7,6 +7,7 @@ FileMind 是《智能软件工程》课程项目，面向大学生和个人用�
 - 使用 Python 3.12、PySide6 Qt Widgets、SQLite 和 uv。应用源码在 `src/filemind/`，测试在 `tests/`。界面负责交互和状态展示，耗时解析、索引和模型调用放在后台应用服务。
 - 框架阶段建立桌面入口和本地存储。先完成 P0 的导入、索引、检索、预览和问答，再完成 P1 的标签、完全重复检测和安全整理。当前状态和验收证据见 [开发进度](docs/progress.md)。
 - 按 [开发与版本管理](docs/development.md) 在功能分支提交。依赖变更同时维护 `pyproject.toml` 和 `uv.lock`。按 [文档索引](docs/README.md) 更新受影响的需求、架构、进度和变更日志。
+- 所有提交标题使用 Conventional Commits 格式 `<类型>: <简述>`。按变更内容选择类型，例如 `feat: 添加文件检索`、`fix: 修复重复结果`、`docs: 更新验收记录`。
 
 ## 实现边界
 
