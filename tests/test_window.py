@@ -167,6 +167,20 @@ def test_desktop_import_search_and_open_citation(
     monkeypatch.setattr(
         QFileDialog, "getOpenFileNames", staticmethod(lambda *a, **k: ([str(source)], ""))
     )
+    monkeypatch.setenv("FILEMIND_LLM_URL", "https://provider.invalid/v1/chat/completions")
+    monkeypatch.setenv("FILEMIND_LLM_MODEL", "mock")
+    monkeypatch.setenv("FILEMIND_LLM_API_KEY", "example-key")
+    requests = []
+
+    def mock_answer(settings, question, evidence):
+        requests.append((settings.model, question))
+        passage = evidence[0].passage
+        return {
+            "answer": "FIRST/FOLLOW 用来构造预测分析表。[1]",
+            "citations": [{"chunk_id": passage.chunk_id, "version": passage.file.version}],
+        }
+
+    monkeypatch.setattr("filemind.qa._request_answer", mock_answer)
     paths = AppPaths.resolve(tmp_path / "app")
     paths.prepare()
     store = LocalStore(paths.database)
@@ -188,6 +202,17 @@ def test_desktop_import_search_and_open_citation(
         QTest.mouseClick(window.search_page.ask_button, Qt.MouseButton.LeftButton)
         wait_for_task(window)
         assert "原文摘录" in window.search_page.note.text()
+        assert not requests
+
+        click_navigation(window, 3)
+        assert window.settings_page.remote.isEnabled()
+        window.settings_page.remote.click()
+        click_navigation(window, 1)
+        QTest.mouseClick(window.search_page.ask_button, Qt.MouseButton.LeftButton)
+        wait_for_task(window)
+        assert requests == [("mock", "FIRST/FOLLOW")]
+        assert window.search_page.answer.isVisible()
+        assert window.search_page.answer.toPlainText().endswith("[1]")
         citation = window.search_page.results.item(0)
         assert citation.text().startswith("[1] 编译原理.txt")
         result_list = window.search_page.results
