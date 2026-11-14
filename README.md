@@ -45,7 +45,9 @@ Windows x64 优先用 DirectML GPU 计算 BGE 向量，GPU 不可用时会回退
 
 ### 带引用问答
 
-问答默认展示带位置的原文摘录。使用兼容 Chat Completions 的服务时，在启动前设置 `FILEMIND_LLM_URL`（完整的 HTTPS 接口地址）、`FILEMIND_LLM_MODEL` 和 `FILEMIND_LLM_API_KEY`。每次启动后，可在「设置与任务」勾选「允许远程问答」。问答只发送当前问题和限定范围内的相关摘录及引用编号。服务不可用或引用校验失败时，应用展示仍可核对的摘录。
+问答默认展示带位置的原文摘录。使用兼容 Chat Completions 的服务时，在启动前设置 `FILEMIND_LLM_URL`（完整的 HTTPS 接口地址）、`FILEMIND_LLM_MODEL` 和 `FILEMIND_LLM_API_KEY`。直连 OpenAI 可用 `https://api.openai.com/v1/chat/completions` 和模型名 `gpt-6-luna`。参见 [OpenAI 官方模型文档](https://developers.openai.com/api/docs/models/gpt-6-luna)。
+
+如果 FileMind 已在托盘运行，先通过托盘菜单退出，再从有配置的环境启动。打开「设置与任务」，勾选「允许远程问答」后，问答会向指定服务发送当前问题、限定范围内的相关摘录及引用编号。证据不足时会说明原因，并保留已找到的摘录。服务不可用或引用校验失败时也可查看原文摘录。
 
 ### 独立数据目录与诊断
 
