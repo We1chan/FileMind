@@ -7,7 +7,7 @@ from typing import Literal
 from filemind.embeddings import ModelError, SemanticIndex
 from filemind.library import Library, _continue
 from filemind.storage import FileRecord, Passage, SearchScope
-from filemind.text_index import catalog_terms, fts_query, significant_terms
+from filemind.text_index import catalog_terms, significant_terms
 
 SearchMode = Literal["keyword", "semantic", "hybrid", "filename"]
 MAX_QUERY_CHARS = 1_500
@@ -110,14 +110,9 @@ class Search:
         keyword_rows = []
         if mode != "semantic":
             terms = significant_terms(query)
-            strict = " AND ".join(terms)
-            keyword_rows = self.store.keyword_ranks(strict, scope)
-            if not keyword_rows:
-                relaxed = " OR ".join(terms) if len(terms) >= 5 else fts_query(query)
-                if relaxed != strict:
-                    keyword_rows = self.store.keyword_ranks(
-                        relaxed, scope, terms=terms if len(terms) >= 5 else ()
-                    )
+            keyword_rows = self.store.keyword_ranks(" AND ".join(terms), scope)
+            if not keyword_rows and len(terms) >= 3:
+                keyword_rows = self.store.keyword_ranks(" OR ".join(terms), scope, terms=terms)
         catalog_ids = []
         if mode != "semantic" and not scope.content_only:
             terms = catalog_terms(query).split()[:24]

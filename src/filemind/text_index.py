@@ -69,10 +69,6 @@ def keyword_terms(text: str, *, precise: bool = False) -> Iterator[str]:
             yield "t" + word.encode("utf-8").hex()
 
 
-def fts_query(query: str) -> str:
-    return " OR ".join(list(dict.fromkeys(keyword_terms(query)))[:64])
-
-
 def significant_terms(query: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(keyword_terms(query, precise=True)))[:64]
 

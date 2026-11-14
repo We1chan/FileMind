@@ -212,6 +212,14 @@ def test_copy_reuses_vector_and_refreshes_cached_search(
     monkeypatch.setattr("filemind.embeddings.BgeModel", lambda _: Model())
     semantic = SemanticIndex(model, library.store)
     scope = SearchScope(content_only=True)
+    reads = []
+    read_embeddings = library.store.embeddings
+
+    def track_reads(fingerprint, scope, *, chunk_ids=None):
+        reads.append(chunk_ids)
+        return read_embeddings(fingerprint, scope, chunk_ids=chunk_ids)
+
+    monkeypatch.setattr(library.store, "embeddings", track_reads)
     first, second = tmp_path / "source-a.txt", tmp_path / "source-b.txt"
     text = "ReusableCopyNeedle"
     first.write_text(text, encoding="utf-8")
@@ -223,11 +231,29 @@ def test_copy_reuses_vector_and_refreshes_cached_search(
     assert len(semantic.rank("needle", scope, lambda: False, populate=False)) == 1
     revision = library.store.vector_revision
     assert semantic.populate_batch()
-    stored = list(library.store.embeddings(FINGERPRINT, scope))
+    stored = list(read_embeddings(FINGERPRINT, scope))
     appended = next(chunk_id for file_id, chunk_id, _ in stored if file_id == records[1].id)
     assert library.store.vector_updates_since(revision)[1] == {appended}
     assert len(semantic.rank("needle", scope, lambda: False, populate=False)) == 2
+    assert reads == [None, [appended]]
     assert generated.count(text) == 1
+
+    revision = library.store.vector_revision
+    third = tmp_path / "unrelated.txt"
+    third.write_text("Unrelated text without an embedding.", encoding="utf-8")
+    library.import_files([third])
+    assert library.store.vector_revision == revision
+    assert len(semantic.rank("needle", scope, lambda: False, populate=False)) == 2
+    assert reads == [None, [appended]]
 
     library.store.set_embeddings(FINGERPRINT, [(stored[0][2], stored[0][1])])
     assert len(semantic.rank("needle", scope, lambda: False, populate=False)) == 2
+    assert reads[-1] is None
+
+    revision = library.store.vector_revision
+    library.path_for(records[0]).write_text("Replacement body", encoding="utf-8")
+    library.retry(records[0].id)
+    assert library.store.vector_updates_since(revision)[1] is None
+    assert [
+        file_id for file_id, _ in semantic.rank("needle", scope, lambda: False, populate=False)
+    ] == [records[1].id]
