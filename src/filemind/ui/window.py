@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl
-from PySide6.QtGui import QCloseEvent, QDesktopServices, QTextCursor
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QTextCursor, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -37,10 +37,18 @@ from filemind import __version__
 from filemind.config import AppPaths
 from filemind.continuous import ContinuousIndex
 from filemind.documents import EXTENSIONS
-from filemind.library import FileAccessError, ImportReport, Library
+from filemind.library import (
+    DuplicateGroup,
+    DuplicateReport,
+    FileAccessError,
+    ImportReport,
+    Library,
+    suggested_tags,
+)
 from filemind.qa import Questions, RemoteSettings
 from filemind.search import Search
 from filemind.storage import FileRecord, LocalStore, Passage, Source, StorageStatus
+from filemind.ui.organization import OrganizePage, TagDialog
 from filemind.ui.pages import (
     PAGE_SIZE,
     ROLE,
@@ -65,8 +73,6 @@ class Page:
     description: str
     detail_title: str
     detail_hint: str
-    empty_title: str = ""
-    empty_hint: str = ""
 
 
 PAGES = (
@@ -87,11 +93,9 @@ PAGES = (
     Page(
         "organize",
         "智能整理",
-        "审核整理计划并管理受管文件",
-        "计划详情",
-        "选中计划后查看拟移动的文件及其目标位置。",
-        "整理待实现",
-        "标签、完全重复检测、整理预览和撤销正在开发。",
+        "查看内容完全相同的文件及其位置",
+        "重复文件详情",
+        "选择重复组查看 SHA-256，或选择文件查看完整路径。",
     ),
     Page(
         "settings",
@@ -165,12 +169,13 @@ class MainWindow(QMainWindow):
         self.pages.setAccessibleName("工作区")
         self.library_page = LibraryPage()
         self.search_page = SearchPage()
+        self.organize_page = OrganizePage()
         self.settings_page = SettingsPage(storage_status, paths.root, self.remote)
         self.settings_page.startup.setVisible(startup_allowed)
         self.settings_page.startup.setChecked(startup_allowed and starts_with_windows())
         self.settings_page.pause.setVisible(self.monitor is not None)
         self.settings_page.pause.setChecked(self.monitor is not None and self.monitor.paused)
-        bodies = (self.library_page, self.search_page, None, self.settings_page)
+        bodies = (self.library_page, self.search_page, self.organize_page, self.settings_page)
         for page, body in zip(PAGES, bodies, strict=True):
             item = QListWidgetItem(page.title)
             item.setSizeHint(QSize(0, 43))
@@ -180,6 +185,11 @@ class MainWindow(QMainWindow):
         self.detail_title = label("", "SectionTitle")
         self.detail_hint = label("", "Hint", wrap=True)
         self.detail_hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.detail_value = QPlainTextEdit()
+        self.detail_value.setReadOnly(True)
+        self.detail_value.setMaximumHeight(100)
+        self.detail_value.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.tags_button = button("编辑标签", "EditTags")
         self.preview = QPlainTextEdit()
         self.preview.setObjectName("SourcePreview")
         self.preview.setAccessibleName("引用对应的原文")
@@ -277,6 +287,8 @@ class MainWindow(QMainWindow):
         detail_layout.setSpacing(10)
         detail_layout.addWidget(self.detail_title)
         detail_layout.addWidget(self.detail_hint)
+        detail_layout.addWidget(self.detail_value)
+        detail_layout.addWidget(self.tags_button, alignment=Qt.AlignmentFlag.AlignLeft)
         detail_layout.addWidget(self.preview, 1)
         detail_layout.addStretch()
         splitter.addWidget(detail)
@@ -307,7 +319,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(label(f"版本 {__version__}", "Version"))
         return sidebar
 
-    def _make_page(self, page: Page, body: QWidget | None) -> QWidget:
+    def _make_page(self, page: Page, body: QWidget) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 1, 0, 0)
@@ -315,22 +327,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(label(page.title, "PageTitle"))
         layout.addWidget(label(page.description, "Hint", wrap=True))
         layout.addSpacing(10)
-        layout.addWidget(body if body is not None else self._make_empty_state(page), 1)
+        layout.addWidget(body, 1)
         return widget
-
-    def _make_empty_state(self, page: Page) -> QFrame:
-        card = QFrame()
-        card.setObjectName("Card")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(22, 22, 22, 22)
-        layout.setSpacing(10)
-        layout.addStretch()
-        for text, role in ((page.empty_title, "SectionTitle"), (page.empty_hint, "Hint")):
-            text_label = label(text, role, wrap=True)
-            text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(text_label)
-        layout.addStretch()
-        return card
 
     def _show_page(self, index: int) -> None:
         page = PAGES[index]
@@ -338,6 +336,8 @@ class MainWindow(QMainWindow):
         self._reset_detail()
         if page.key == "library":
             self._file_detail()
+        elif page.key == "organize":
+            self._duplicate_detail()
         elif page.key == "settings":
             self._task_detail()
             self.settings_page.model_status.setText(self.search.semantic.status)
@@ -346,6 +346,8 @@ class MainWindow(QMainWindow):
         page = PAGES[self.pages.currentIndex()]
         self.detail_title.setText(page.detail_title)
         self.detail_hint.setText(page.detail_hint)
+        self.detail_value.hide()
+        self.tags_button.hide()
         self.preview.clear()
         self.preview.hide()
 
@@ -376,6 +378,7 @@ class MainWindow(QMainWindow):
         library.files.itemActivated.connect(self._preview_file)
         library.files.currentItemChanged.connect(self._file_detail)
         library.retry_button.clicked.connect(lambda: self._retry(library.selected_file()))
+        self.tags_button.clicked.connect(self._edit_tags)
 
         search = self.search_page
         search.find_button.clicked.connect(lambda: self._search(False))
@@ -385,6 +388,12 @@ class MainWindow(QMainWindow):
         search.locate_button.clicked.connect(lambda: self._locate(self._result_file()))
         search.results.itemClicked.connect(self._preview_citation)
         search.results.itemActivated.connect(self._preview_citation)
+
+        organize = self.organize_page
+        organize.scan_button.clicked.connect(self._scan_duplicates)
+        organize.cancel_button.clicked.connect(self._cancel_duplicate_scan)
+        organize.results.currentItemChanged.connect(self._duplicate_detail)
+        organize.locate_button.clicked.connect(self._locate_duplicate)
 
         settings = self.settings_page
         settings.open_button.clicked.connect(self._open_data_dir)
@@ -493,6 +502,8 @@ class MainWindow(QMainWindow):
     def _enable_actions(self, enabled: bool) -> None:
         for page in (self.library_page, self.search_page, self.settings_page):
             page.setEnabled(enabled)
+        self.tags_button.setEnabled(enabled)
+        self.organize_page.enable_actions(enabled)
 
     def _finished(self) -> None:
         task = self.task
@@ -708,6 +719,61 @@ class MainWindow(QMainWindow):
         self._reset_detail()
         if file := self.library_page.selected_file():
             self._display_file(file)
+            self.tags_button.show()
+
+    def _edit_tags(self) -> None:
+        file = self.library_page.selected_file()
+        if file is None:
+            return
+        dialog = TagDialog(self, file, self.store.file_tags(file.id), suggested_tags(file))
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            tags = dialog.tags()
+            self._start(
+                "正在保存标签…",
+                lambda _: self.library.set_file_tags(file.id, tags),
+                self._tags_saved,
+                writes=True,
+            )
+        dialog.deleteLater()
+
+    def _tags_saved(self, _result: object) -> None:
+        self._file_detail()
+        self.statusBar().showMessage("标签已保存。", 3500)
+
+    def _scan_duplicates(self) -> None:
+        if self.task is not None or self.closing:
+            return
+        self._start("正在扫描完全重复的文件…", self.library.find_duplicates, self._duplicates_found)
+        self.organize_page.cancel_button.setEnabled(True)
+        self.organize_page.cancel_button.show()
+
+    def _cancel_duplicate_scan(self) -> None:
+        if self.task is not None:
+            self.task.requestInterruption()
+            self.organize_page.cancel_button.setEnabled(False)
+            self.statusBar().showMessage("正在取消重复文件扫描…")
+
+    def _duplicates_found(self, report: DuplicateReport | None) -> None:
+        if report is None:
+            self.statusBar().showMessage("已取消重复文件扫描。", 3500)
+        else:
+            self.organize_page.show_report(report, self.library.path_for)
+
+    def _duplicate_detail(self) -> None:
+        if self.pages.currentIndex() != 2:
+            return
+        self._reset_detail()
+        entry = self.organize_page.selected()
+        if isinstance(entry, FileRecord):
+            self._display_file(entry)
+        elif isinstance(entry, DuplicateGroup):
+            self.detail_hint.setText(f"{len(entry.files):,} 份相同内容\n\nSHA-256")
+            self._show_detail_value(entry.sha256, "SHA-256")
+
+    def _locate_duplicate(self) -> None:
+        entry = self.organize_page.selected()
+        if isinstance(entry, FileRecord):
+            self._locate(self.store.file(entry.id))
 
     def _task_detail(self) -> None:
         if self.pages.currentIndex() != 3:
@@ -720,14 +786,22 @@ class MainWindow(QMainWindow):
             self.detail_hint.setText(f"{entry.path}\n\n{entry.reason or '只读关联目录'}")
 
     def _display_file(self, file: FileRecord) -> None:
+        tags = self.store.file_tags(file.id)
         parts = (
             file.name,
             file_origin(file),
             STATUS[file.status],
             file.reason,
-            str(self.library.path_for(file)),
+            "标签\n" + "、".join(tags) if tags else "",
+            "文件路径",
         )
         self.detail_hint.setText("\n\n".join(filter(None, parts)))
+        self._show_detail_value(str(self.library.path_for(file)), "文件路径")
+
+    def _show_detail_value(self, value: str, name: str) -> None:
+        self.detail_value.setAccessibleName(name)
+        self.detail_value.setPlainText(value)
+        self.detail_value.show()
 
     def _search(self, ask: bool) -> None:
         page = self.search_page
@@ -807,6 +881,7 @@ class MainWindow(QMainWindow):
         self.detail_hint.setText(
             f"{passage.file.name}\n{passage.location} · {file_origin(passage.file)}"
         )
+        self.detail_value.hide()
         self.preview.setPlainText(passage.section_text)
         offset = passage.text.find(quote) if quote else -1
         start = passage.start + offset if offset >= 0 else passage.start

@@ -7,10 +7,11 @@ import pytest
 from PySide6.QtCore import QEvent, QEventLoop, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QPushButton
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QFileDialog, QLabel, QPushButton
 
 from filemind.config import AppPaths
 from filemind.storage import LocalStore
+from filemind.ui.organization import TagDialog
 from filemind.ui.window import MainWindow
 
 
@@ -38,7 +39,7 @@ def test_switching_pages_and_reopening_window(app: QApplication, tmp_path: Path)
         expected = [
             ("文件库", "文件详情"),
             ("智能检索", "原文与引用"),
-            ("智能整理", "计划详情"),
+            ("智能整理", "重复文件详情"),
             ("设置与任务", "任务详情"),
         ]
         for index, (title, detail) in enumerate(expected):
@@ -225,5 +226,84 @@ def test_desktop_import_search_and_open_citation(
         assert window.preview.isVisible()
         assert "第 1 行" in window.detail_hint.text()
         assert window.preview.toPlainText() == source.read_text(encoding="utf-8")
+    finally:
+        close_window(window)
+
+
+def test_desktop_saves_tags_and_displays_each_duplicate_path(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    note, copy = tmp_path / "实验笔记.txt", tmp_path / "备份.txt"
+    note.write_text("记录语法分析实验步骤。", encoding="utf-8")
+    copy.write_bytes(note.read_bytes())
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileNames", staticmethod(lambda *a, **k: ([str(note), str(copy)], ""))
+    )
+    paths = AppPaths.resolve(tmp_path / "app")
+    paths.prepare()
+    store = LocalStore(paths.database)
+    window = MainWindow(paths, store, store.initialize())
+    window.show()
+    app.processEvents()
+
+    def edit_tags() -> None:
+        dialog = window.findChild(TagDialog)
+        if dialog is None:
+            return
+        try:
+            dialog.editor.setText("编译原理")
+            for action in dialog.findChildren(QPushButton, "SuggestedTag"):
+                if action.accessibleName() == "添加建议标签 实验":
+                    QTest.mouseClick(action, Qt.MouseButton.LeftButton)
+            QTest.mouseClick(
+                dialog.buttons.button(QDialogButtonBox.StandardButton.Save),
+                Qt.MouseButton.LeftButton,
+            )
+        finally:
+            if dialog.isVisible():
+                dialog.reject()
+
+    try:
+        QTest.mouseClick(window.library_page.import_button, Qt.MouseButton.LeftButton)
+        wait_for_task(window)
+        files = window.library_page.files
+        note_item = next(
+            files.item(row) for row in range(files.count()) if note.name in files.item(row).text()
+        )
+        QTest.mouseClick(
+            files.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=files.visualItemRect(note_item).center(),
+        )
+        assert window.tags_button.isVisible()
+        QTimer.singleShot(0, edit_tags)
+        QTest.mouseClick(window.tags_button, Qt.MouseButton.LeftButton)
+        wait_for_task(window)
+        file = window.library_page.selected_file()
+        assert file is not None and store.file_tags(file.id) == ("实验", "编译原理")
+        assert "实验、编译原理" in window.detail_hint.text()
+
+        click_navigation(window, 2)
+        page = window.organize_page
+        QTest.mouseClick(page.scan_button, Qt.MouseButton.LeftButton)
+        wait_for_task(window)
+        assert not page.cancel_button.isVisible()
+        assert page.results.topLevelItemCount() == 1
+        group = page.results.topLevelItem(0)
+        assert group.isExpanded() and group.childCount() == 2
+        assert "SHA-256" in window.detail_hint.text()
+        assert window.detail_value.isVisible() and window.detail_value.toPlainText() == file.sha256
+        assert {group.child(row).toolTip(0) for row in range(group.childCount())} == {
+            str(window.library.path_for(record)) for record in store.files()
+        }
+        child = group.child(0)
+        QTest.mouseClick(
+            page.results.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=page.results.visualItemRect(child).center(),
+        )
+        assert page.locate_button.isEnabled()
+        assert window.detail_value.isVisible()
+        assert window.detail_value.toPlainText() == child.toolTip(0)
     finally:
         close_window(window)

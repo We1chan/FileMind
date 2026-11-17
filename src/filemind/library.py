@@ -5,15 +5,22 @@ import json
 import os
 import re
 import stat
+import unicodedata
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 from uuid import uuid4
 
 from filemind.config import AppPaths, checkout_data_dir, installed_data_dir
 from filemind.documents import (
+    ARCHIVE_EXTENSIONS,
     EXTENSIONS,
     MAX_FILE_BYTES,
+    SHEET_EXTENSIONS,
+    SLIDE_EXTENSIONS,
     TEXT_EXTENSIONS,
     DocumentError,
     file_extension,
@@ -57,6 +64,15 @@ _SENSITIVE = re.compile(
     r"(?:api[ _-]?keys?|access[ _-]?tokens?)|id_rsa|id_ed25519|kubeconfig)(?:$|[ ._-])",
     re.IGNORECASE,
 )
+_FORMAT_TAGS = {
+    **dict.fromkeys(SLIDE_EXTENSIONS, "演示文稿"),
+    ".ppt": "演示文稿",
+    **dict.fromkeys(SHEET_EXTENSIONS, "表格"),
+    **dict.fromkeys(ARCHIVE_EXTENSIONS, "压缩包"),
+    ".exe": "程序",
+}
+_FILENAME_TAGS = ("课件", "作业", "实验", "笔记", "报告")
+_HASH_READ_BYTES = 1024 * 1024
 
 
 def _continue() -> bool:
@@ -71,6 +87,25 @@ class FileAccessError(ValueError):
 class ImportReport:
     count: int
     skipped: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateGroup:
+    sha256: str
+    files: tuple[FileRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicateReport:
+    groups: tuple[DuplicateGroup, ...]
+    skipped: int
+
+
+def suggested_tags(file: FileRecord) -> tuple[str, ...]:
+    return (
+        _FORMAT_TAGS.get(file.extension, "文档"),
+        *(tag for tag in _FILENAME_TAGS if tag in file.name),
+    )
 
 
 def _key(path: Path) -> str:
@@ -138,23 +173,42 @@ def _stored_fingerprint(file: FileRecord) -> tuple[int | None, int | None, int |
     return file.size, file.modified_ns, file.changed_ns, file.identity
 
 
-def _read(path: Path, info: os.stat_result) -> bytes:
-    def matches(candidate: os.stat_result) -> bool:
-        return os.path.samestat(info, candidate) and _signature(info) == _signature(candidate)
-
+@contextmanager
+def _open_current(path: Path, info: os.stat_result) -> Iterator[BinaryIO]:
     with path.open("rb") as stream:
         opened = os.fstat(stream.fileno())
         # On Windows, fstat and lstat can report different ctime values after a rename.
         if not os.path.samestat(info, opened) or _signature(info)[:2] != _signature(opened)[:2]:
             raise FileAccessError("文件在读取前发生变化，请刷新索引。")
-        data = stream.read(MAX_FILE_BYTES + 1)
-        if _signature(opened) != _signature(os.fstat(stream.fileno())) or not matches(
-            _inspect(path)
+        yield stream
+        after_read = os.fstat(stream.fileno())
+        if _signature(after_read) != _signature(opened) or (
+            _fingerprint(_inspect(path)) != _fingerprint(info)
         ):
             raise FileAccessError("文件在读取时发生变化，请刷新索引。")
+
+
+def _read(path: Path, info: os.stat_result) -> bytes:
+    with _open_current(path, info) as stream:
+        data = stream.read(MAX_FILE_BYTES + 1)
     if len(data) > MAX_FILE_BYTES:
         raise FileAccessError("文件超过 32 MiB。")
     return data
+
+
+def _hash_file(path: Path, info: os.stat_result, cancelled: Callable[[], bool]) -> str | None:
+    digest = hashlib.sha256()
+    remaining = info.st_size
+    with _open_current(path, info) as stream:
+        while remaining:
+            if cancelled():
+                return None
+            block = stream.read(min(remaining, _HASH_READ_BYTES))
+            if not block:
+                raise FileAccessError("文件在读取时发生变化，请刷新索引。")
+            digest.update(block)
+            remaining -= len(block)
+    return digest.hexdigest()
 
 
 def _reason(error: OSError | ValueError) -> str:
@@ -252,6 +306,70 @@ class Library:
             _, info = self._external(path, Path(file.source_path))
         _require_file(info)
         return info
+
+    def set_file_tags(self, file_id: int, tags: Iterable[str]) -> None:
+        normalized = {}
+        for value in tags:
+            tag = unicodedata.normalize("NFC", value.strip())
+            if not tag:
+                continue
+            if len(tag.splitlines()) > 1 or "\x00" in tag or "," in tag or "，" in tag:
+                raise FileAccessError("标签须为单行文字，多个标签用逗号分隔。")
+            normalized.setdefault(tag.casefold(), tag)
+        if not self.store.set_file_tags(file_id, normalized.values()):
+            raise FileAccessError("文件已从资料库移除，无法保存标签。")
+
+    def find_duplicates(self, cancelled: Callable[[], bool] = _continue) -> DuplicateReport | None:
+        by_size: dict[int, list[tuple[FileRecord, Path, os.stat_result]]] = defaultdict(list)
+        seen_paths = set()
+        skipped = 0
+        for file in self.store.files():
+            if cancelled():
+                return None
+            if file.import_from is not None or file.status == "missing":
+                continue
+            try:
+                path = self.path_for(file)
+                key = _key(path)
+                if key in seen_paths:
+                    continue
+                info = self._file_info(file, path)
+            except (OSError, FileAccessError):
+                skipped += 1
+                continue
+            seen_paths.add(key)
+            by_size[info.st_size].append((file, path, info))
+
+        matches: dict[str, list[FileRecord]] = defaultdict(list)
+        for candidates in by_size.values():
+            if len(candidates) < 2:
+                continue
+            for file, path, info in candidates:
+                if cancelled():
+                    return None
+                try:
+                    fingerprint = _fingerprint(info)
+                    if _fingerprint(self._file_info(file, path)) != fingerprint:
+                        skipped += 1
+                        continue
+                    digest = file.sha256 if fingerprint == _stored_fingerprint(file) else None
+                    if digest is None:
+                        digest = _hash_file(path, info, cancelled)
+                except (OSError, FileAccessError):
+                    skipped += 1
+                    continue
+                if digest is None:
+                    return None
+                matches[digest].append(file)
+
+        return DuplicateReport(
+            tuple(
+                DuplicateGroup(digest, tuple(files))
+                for digest, files in matches.items()
+                if len(files) > 1
+            ),
+            skipped,
+        )
 
     def import_files(
         self, paths: Iterable[Path], cancelled: Callable[[], bool] = _continue

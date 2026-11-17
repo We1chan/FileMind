@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from filemind.config import AppPaths
-from filemind.library import Library
+from filemind.library import FileAccessError, Library, suggested_tags
 from filemind.search import Search
 from filemind.storage import SCHEMA_VERSION, LocalStore, UnsupportedSchemaError
 
@@ -68,6 +68,7 @@ def test_rebuilds_filename_index_for_version_two_library(tmp_path: Path) -> None
     library.import_files([note])
     original = library.preview_file(store.files()[0].id)
     with closing(sqlite3.connect(paths.database)) as connection, connection:
+        connection.execute("DROP TABLE file_tags")
         connection.execute("DROP TABLE file_catalog")
         connection.execute("DROP INDEX files_display_order")
         connection.execute("DROP INDEX files_by_status")
@@ -98,6 +99,7 @@ def test_version_three_library_gets_hash_index_without_changing_references(
     library.import_files([note])
     passage = library.preview_file(library.store.files()[0].id)
     with closing(sqlite3.connect(library.paths.database)) as connection, connection:
+        connection.execute("DROP TABLE file_tags")
         connection.execute("DROP INDEX files_by_hash")
         connection.execute("ALTER TABLE files DROP COLUMN parser_version")
         connection.execute("ALTER TABLE sections DROP COLUMN heading")
@@ -109,3 +111,44 @@ def test_version_three_library_gets_hash_index_without_changing_references(
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'files_by_hash'"
         ).fetchone() == ("files_by_hash",)
+
+
+def test_migrates_version_four_and_persists_tags_by_file_id(
+    library: Library, tmp_path: Path
+) -> None:
+    source = tmp_path / "课程资料"
+    source.mkdir()
+    note = source / "实验笔记.txt"
+    note.write_text("VersionFourCitationNeedle", encoding="utf-8")
+    source_id = library.link_directory(source)
+    file = library.store.files()[0]
+    passage = library.preview_file(file.id)
+    with closing(sqlite3.connect(library.paths.database)) as connection, connection:
+        connection.execute("DROP TABLE file_tags")
+        connection.execute("PRAGMA user_version = 4")
+
+    store = LocalStore(library.paths.database)
+    assert store.initialize().schema_version == SCHEMA_VERSION
+    migrated = Library(library.paths, store)
+    assert migrated.preview(passage.chunk_id, file.version) == passage
+    assert store.file_tags(file.id) == ()
+    assert suggested_tags(file) == ("文档", "实验", "笔记")
+    assert store.file_tags(file.id) == ()
+
+    migrated.set_file_tags(file.id, [" 课程 ", "", "CS", "cs"])
+    reopened = LocalStore(library.paths.database)
+    reopened.initialize()
+    assert reopened.file_tags(file.id) == ("CS", "课程")
+    assert migrated.preview(passage.chunk_id, file.version) == passage
+    assert note.read_text(encoding="utf-8") == "VersionFourCitationNeedle"
+
+    note.write_text("NewFileContent", encoding="utf-8")
+    migrated.retry(file.id)
+    assert reopened.file_tags(file.id) == ("CS", "课程")
+    migrated.set_file_tags(file.id, [])
+    assert reopened.file_tags(file.id) == ()
+    migrated.set_file_tags(file.id, ["实验"])
+    reopened.remove_source(source_id)
+    assert reopened.file_tags(file.id) == ()
+    with pytest.raises(FileAccessError, match="已从资料库移除"):
+        migrated.set_file_tags(file.id, ["课程"])

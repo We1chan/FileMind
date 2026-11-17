@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 
@@ -224,6 +225,51 @@ def test_search_folds_identical_content_within_scope_and_keeps_a_current_preview
     assert current.file.id == second_id
     passage = current.passages[0]
     assert library.preview(passage.chunk_id, current.file.version).text == "uniqueDuplicateNeedle"
+
+
+def test_duplicate_scan_groups_current_contents_and_keeps_each_path(
+    library: Library, tmp_path: Path
+) -> None:
+    original = tmp_path / "实验.txt"
+    original.write_bytes(b"first note")
+    assert library.import_files([original]).count == 1
+    managed = library.path_for(library.store.files()[0])
+
+    source = tmp_path / "linked"
+    source.mkdir()
+    same_name, same_content = source / original.name, source / "备份.txt"
+    same_name.write_bytes(b"other note")
+    same_content.write_bytes(original.read_bytes())
+    first_zip, second_zip = source / "资料.zip", source / "存档.zip"
+    with ZipFile(first_zip, "w") as archive:
+        archive.writestr("notes.txt", "archived contents")
+    second_zip.write_bytes(first_zip.read_bytes())
+    empty_a, empty_b = source / "empty_a.txt", source / "empty_b.txt"
+    empty_a.touch()
+    empty_b.touch()
+    library.link_directory(source)
+    assert all(file.sha256 is None for file in library.store.files() if file.extension == ".zip")
+
+    report = library.find_duplicates()
+    assert report is not None and report.skipped == 0
+    assert {
+        frozenset(library.path_for(file) for file in group.files) for group in report.groups
+    } == {
+        frozenset((managed, same_content)),
+        frozenset((first_zip, second_zip)),
+        frozenset((empty_a, empty_b)),
+    }
+
+    before = same_content.stat()
+    same_content.write_bytes(same_name.read_bytes())
+    os.utime(same_content, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    second_zip.unlink()
+    report = library.find_duplicates()
+    assert report is not None and report.skipped == 1
+    assert {
+        frozenset(library.path_for(file) for file in group.files) for group in report.groups
+    } == {frozenset((same_name, same_content)), frozenset((empty_a, empty_b))}
+    assert managed.read_bytes() == original.read_bytes()
 
 
 @pytest.mark.parametrize("mode", ["filename", "keyword"])

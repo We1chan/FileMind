@@ -3,7 +3,7 @@
 import json
 import sqlite3
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +18,7 @@ from filemind.documents import (
 )
 from filemind.text_index import TextChunk, catalog_terms
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 OFFICE_PARSER_VERSION = 1
 RECHUNKED_EXTENSIONS = (*WORD_EXTENSIONS, *SHEET_EXTENSIONS, *LEGACY_OFFICE_EXTENSIONS)
 _LIBRARY_SCHEMA = (
@@ -248,6 +248,14 @@ class LocalStore:
                 connection.execute(
                     "ALTER TABLE sections ADD COLUMN heading TEXT NOT NULL DEFAULT ''"
                 )
+            if schema_version < 5:
+                connection.execute(
+                    """CREATE TABLE file_tags (
+                        file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                        tag TEXT NOT NULL,
+                        PRIMARY KEY (file_id, tag)
+                    )"""
+                )
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             if not any(
                 row[1] == "identity" for row in connection.execute("PRAGMA table_info(files)")
@@ -460,6 +468,29 @@ class LocalStore:
                 f"SELECT f.*, src.path AS source_path {_FILES} WHERE f.id = ?", (file_id,)
             ).fetchone()
             return _file(row) if row else None
+
+    def file_tags(self, file_id: int) -> tuple[str, ...]:
+        with self._session() as connection:
+            rows = connection.execute(
+                "SELECT tag FROM file_tags WHERE file_id = ? ORDER BY tag COLLATE NOCASE, tag",
+                (file_id,),
+            )
+            return tuple(row[0] for row in rows)
+
+    def set_file_tags(self, file_id: int, tags: Iterable[str]) -> bool:
+        with self._session() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if (
+                connection.execute("SELECT 1 FROM files WHERE id = ?", (file_id,)).fetchone()
+                is None
+            ):
+                return False
+            connection.execute("DELETE FROM file_tags WHERE file_id = ?", (file_id,))
+            connection.executemany(
+                "INSERT INTO file_tags(file_id, tag) VALUES (?, ?)",
+                ((file_id, tag) for tag in tags),
+            )
+        return True
 
     def files_by_id(self, file_ids: set[int]) -> dict[int, FileRecord]:
         ids = list(file_ids)

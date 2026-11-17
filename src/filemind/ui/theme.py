@@ -56,7 +56,7 @@ QPushButton[action="true"]:disabled {
     background: #eaf0f4;
     border-color: #dce4ed;
 }
-QLineEdit, QComboBox, QPlainTextEdit, QListWidget[results="true"] {
+QLineEdit, QComboBox, QPlainTextEdit, QListWidget[results="true"], QTreeWidget[results="true"] {
     background: #ffffff;
     color: #132638;
     border: 1px solid #c9d7e2;
@@ -65,7 +65,8 @@ QLineEdit, QComboBox, QPlainTextEdit, QListWidget[results="true"] {
     selection-background-color: #c7e9e1;
     selection-color: #123c36;
 }
-QLineEdit:focus, QComboBox:focus, QListWidget[results="true"]:focus { border-color: #318578; }
+QLineEdit:focus, QComboBox:focus, QListWidget[results="true"]:focus,
+QTreeWidget[results="true"]:focus { border-color: #318578; }
 QComboBox { padding-right: 24px; }
 QComboBox::drop-down {
     subcontrol-origin: padding;
@@ -74,8 +75,14 @@ QComboBox::drop-down {
     border: none;
 }
 QListWidget[results="true"]::item { padding: 7px 6px; border-bottom: 1px solid #eef2f6; }
-QListWidget[results="true"]::item:hover { background: #eaf4f2; }
-QListWidget[results="true"]::item:selected { background: #c7e9e1; color: #123c36; }
+QTreeWidget[results="true"]::item { padding: 5px 6px; border-bottom: 1px solid #eef2f6; }
+QListWidget[results="true"]::item:hover, QTreeWidget[results="true"]::item:hover {
+    background: #eaf4f2;
+}
+QListWidget[results="true"]::item:selected, QTreeWidget[results="true"]::item:selected {
+    background: #c7e9e1;
+    color: #123c36;
+}
 """
 
 
