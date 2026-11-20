@@ -61,6 +61,7 @@ from filemind.ui.pages import (
     file_origin,
     label,
 )
+from filemind.ui.pdf_reader import PdfReader
 from filemind.ui.theme import WINDOW_STYLE, application_icon
 from filemind.windows import common_locations, set_startup, starts_with_windows
 
@@ -168,6 +169,7 @@ class MainWindow(QMainWindow):
         self.navigation.setObjectName("Navigation")
         self.navigation.setAccessibleName("主导航")
         self.navigation.setSpacing(3)
+        self.navigation.setIconSize(QSize(23, 23))
         self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self.pages = QStackedWidget()
@@ -302,10 +304,13 @@ class MainWindow(QMainWindow):
         detail_layout.setSpacing(10)
         detail_layout.addWidget(self.detail_title)
         detail_layout.addWidget(self.detail_hint)
+        self.pdf = PdfReader()
+        self.pdf.render_failed.connect(self._pdf_failed)
+        detail_layout.addWidget(self.pdf, 1)
         detail_layout.addWidget(self.preview, 1)
         self.ask_file = button("基于此文件提问", "AskFile")
         self.ask_file.clicked.connect(self._ask_file)
-        detail_layout.addWidget(self.ask_file)
+        detail_layout.addWidget(self.ask_file, alignment=Qt.AlignmentFlag.AlignHCenter)
         detail_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         splitter.addWidget(detail)
         splitter.setStretchFactor(0, 2)
@@ -384,6 +389,9 @@ class MainWindow(QMainWindow):
         page = PAGES[self.pages.currentIndex()]
         self.detail_title.setText(page.detail_title)
         self.detail_hint.setText(page.detail_hint)
+        self.pdf.reset()
+        self.detail_hint.show()
+        self.detail_title.show()
         self.preview.clear()
         self.preview.hide()
 
@@ -804,22 +812,30 @@ class MainWindow(QMainWindow):
         if file is not None and file.status in {"ready", "cataloged"}:
             self._start(
                 "正在核对原文…",
-                lambda _: self.library.preview_file(file.id),
-                lambda passage: self._show_preview(passage, 0),
+                lambda _: self._source_data(self.library.preview_file(file.id)),
+                lambda source: self._show_preview(source[0], 0, pdf_data=source[1]),
             )
 
     def _preview_citation(self, item: QListWidgetItem) -> None:
         citation = item.data(ROLE)
         if isinstance(citation, FileRecord):
             self._reset_detail()
+            if citation.extension == ".pdf" and citation.status == "ready":
+                self._start(
+                    "正在读取 PDF…",
+                    lambda _: self._source_data(self.library.preview_file(citation.id)),
+                    lambda source: self._show_preview(source[0], 1, pdf_data=source[1]),
+                )
+                return
             self.detail_title.setText("文件详情")
             self._display_file(citation)
             return
+        self._reset_detail()
         passage = citation.passage
         self._start(
             "正在核对原文…",
-            lambda _: self.library.preview(passage.chunk_id, passage.file.version),
-            lambda verified: self._show_preview(verified, 1, citation.quote),
+            lambda _: self._load_source(passage),
+            lambda source: self._show_preview(source[0], 1, citation.quote, source[1]),
         )
 
     def _ask_file(self) -> None:
@@ -856,7 +872,17 @@ class MainWindow(QMainWindow):
         except OSError:
             self.statusBar().showMessage("无法在资源管理器中定位文件。", 5000)
 
-    def _show_preview(self, passage: Passage, page: int, quote: str = "") -> None:
+    def _load_source(self, passage):
+        verified = self.library.preview(passage.chunk_id, passage.file.version)
+        return self._source_data(verified)
+
+    def _source_data(self, verified: Passage):
+        data = (
+            self.library.pdf_snapshot(verified.file) if verified.file.extension == ".pdf" else None
+        )
+        return verified, data
+
+    def _show_preview(self, passage: Passage, page: int, quote: str = "", pdf_data=None) -> None:
         if self.pages.currentIndex() != page:
             return
         self.detail_title.setText("原文预览")
@@ -879,3 +905,23 @@ class MainWindow(QMainWindow):
         self.preview.setTextCursor(cursor)
         self.preview.show()
         self.preview.ensureCursorVisible()
+        if pdf_data is not None:
+            parts = passage.location.split()
+            if (
+                len(parts) == 3
+                and parts[1].isdigit()
+                and self.pdf.open_page(
+                    pdf_data, int(parts[1]), self.search_page.query.text().strip()
+                )
+            ):
+                self.detail_title.hide()
+                self.detail_hint.hide()
+                self.pdf.setToolTip(passage.file.name)
+                self.preview.hide()
+
+    def _pdf_failed(self):
+        self.pdf.reset()
+        self.detail_title.show()
+        self.detail_hint.show()
+        self.preview.show()
+        self.statusBar().showMessage("此页无法渲染，已显示索引对应的原文摘录。", 6000)

@@ -635,6 +635,13 @@ class Library:
         except (OSError, FileAccessError):
             return False
 
+    def pdf_snapshot(self, file: FileRecord) -> bytes:
+        path = self.path_for(file)
+        data = _read(path, self._file_info(file, path))
+        if hashlib.sha256(data).hexdigest() != file.sha256:
+            raise FileAccessError("原文已变化。请刷新索引并重新检索。")
+        return data
+
     def preview(self, chunk_id: int, version: int) -> Passage:
         passage = self.store.passage(chunk_id, version)
         if passage is None or not self._preview_current(passage.file):

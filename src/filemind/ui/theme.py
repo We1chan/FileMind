@@ -1,7 +1,7 @@
 """桌面工作区的配色、字体层级和应用图标。"""
 
-from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPixmap
 
 WINDOW_STYLE = """
 QWidget#Shell { background: #faf8f3; color: #1c3026; }
@@ -76,6 +76,11 @@ QComboBox::drop-down {
 QListWidget[results="true"]::item { padding: 7px 6px; border-bottom: 1px solid #eef2f6; }
 QListWidget[results="true"]::item:hover { background: #eaf4f2; }
 QListWidget[results="true"]::item:selected { background: #dce9d5; color: #123c36; }
+QListWidget#Navigation { font-size: 17px; }
+QPushButton#FindContent { min-width: 68px; min-height: 25px; font-size: 16px; }
+QPushButton#ModeChoice { min-width: 44px; }
+QPushButton#ReaderTool { padding: 3px 5px; font-size: 18px; border: none; }
+QPushButton#AskFile { min-width: 160px; font-size: 16px; color: #244e36; border-color:#62816a; }
 QPushButton#ModeChoice:checked { background: #386348; color: white; }
 QLineEdit#SearchQuery { font-size: 18px; padding: 8px 12px; border-color: #607b69; }
 QPlainTextEdit#SourcePreview {
@@ -94,25 +99,16 @@ def application_icon() -> QIcon:
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor("#376449"))
-    painter.drawRoundedRect(QRectF(1, 1, 62, 62), 14, 14)
-
-    document = QPainterPath()
-    document.moveTo(20, 15)
-    document.lineTo(35, 15)
-    document.lineTo(45, 25)
-    document.lineTo(45, 49)
-    document.lineTo(20, 49)
-    document.closeSubpath()
-    document.moveTo(35, 15)
-    document.lineTo(35, 25)
-    document.lineTo(45, 25)
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-    pen = QPen(QColor("#f1fffc"), 3)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    painter.setPen(pen)
-    painter.drawPath(document)
-    painter.drawLine(26, 33, 39, 33)
-    painter.drawLine(26, 40, 36, 40)
+    for points, color in (
+        (((7, 54), (18, 17), (54, 5)), "#dfead4"),
+        (((7, 54), (42, 40), (54, 5)), "#a9c5a8"),
+        (((7, 54), (42, 40), (48, 54)), "#f3f1dd"),
+    ):
+        fold = QPainterPath()
+        fold.moveTo(*points[0])
+        for point in points[1:]:
+            fold.lineTo(*point)
+        fold.closeSubpath()
+        painter.fillPath(fold, QColor(color))
     painter.end()
     return QIcon(pixmap)

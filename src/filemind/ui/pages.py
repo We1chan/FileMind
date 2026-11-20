@@ -1,10 +1,11 @@
 """Qt widgets for browsing, searching and checking index status."""
 
+from datetime import datetime
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QColor, QTextDocument
+from PySide6.QtCore import QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPixmap, QTextDocument
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -182,7 +183,7 @@ class ResultDelegate(QStyledItemDelegate):
         self.term = ""
 
     def sizeHint(self, option, index):
-        return QSize(180, 113)
+        return QSize(180, 131)
 
     def paint(self, painter, option, index):
         lines = index.data().split("\n", 2)
@@ -195,19 +196,47 @@ class ResultDelegate(QStyledItemDelegate):
         rect = option.rect.adjusted(12, 9, -12, -8)
         painter.setClipRect(rect)
         painter.translate(rect.topLeft())
+        entry = index.data(ROLE)
+        file = entry if isinstance(entry, FileRecord) else entry.passage.file
+        ext = file.extension.lstrip(".").upper()
+        color = {"PDF": "#b73c31", "DOCX": "#396ea8", "PPTX": "#b95a30"}.get(ext, "#49735a")
+        painter.setPen(QColor(color))
+        painter.setBrush(QColor("#ffffff"))
+        path = QPainterPath()
+        path.moveTo(4, 6)
+        path.lineTo(21, 6)
+        path.lineTo(30, 15)
+        path.lineTo(30, 40)
+        path.lineTo(4, 40)
+        path.closeSubpath()
+        path.moveTo(21, 6)
+        path.lineTo(21, 15)
+        path.lineTo(30, 15)
+        painter.drawPath(path)
+        painter.fillRect(QRectF(0, 25, 35, 16), QColor(color))
+        painter.setPen(Qt.GlobalColor.white)
+        painter.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        painter.drawText(QRectF(0, 25, 35, 16), Qt.AlignmentFlag.AlignCenter, ext[:5])
+        painter.translate(44, 0)
         document = QTextDocument()
         document.setDefaultFont(option.font)
-        document.setTextWidth(rect.width())
-        title = option.fontMetrics.elidedText(name, Qt.TextElideMode.ElideMiddle, rect.width() - 55)
+        width = max(40, rect.width() - 44)
+        document.setTextWidth(width)
+        title = option.fontMetrics.elidedText(name, Qt.TextElideMode.ElideMiddle, width - 10)
         excerpt = escape(lines[2]) if len(lines) > 2 else ""
         term = escape(self.term)
         if term:
             excerpt = excerpt.replace(term, f'<span style="background:#f1d896">{term}</span>')
-        ext = escape(Path(name).suffix[1:8].upper())
+        metadata = [info]
+        if file.size is not None:
+            metadata.append(f"{file.size / 1024:.0f} KB")
+        if file.modified_ns:
+            date = datetime.fromtimestamp(file.modified_ns / 1e9)
+            metadata.append(f"修改于 {date:%Y-%m-%d}")
         document.setHtml(
-            f'<span style="color:#46674d;font-size:9pt">{ext}</span> &nbsp;'
-            f'<b style="color:#173c2a;font-size:12pt">{escape(title)}</b><br>'
-            f'<span style="color:#59675b">{escape(info)}</span><br>{excerpt}'
+            f'<p style="margin:0 0 5px;color:#192f23;font: bold 13pt SimSun">{escape(title)}</p>'
+            f'<p style="margin:0 0 6px;color:#59675b">{escape(" · ".join(metadata))}</p>'
+            f'<span style="font-size:11pt">{excerpt}</span>'
         )
         document.drawContents(painter)
         painter.restore()
@@ -224,6 +253,14 @@ class SearchPage(QWidget):
         self.query.setObjectName("SearchQuery")
         self.query.setAccessibleName("检索词或问题")
         self.query.setPlaceholderText("输入关键词或问题")
+        mark = QPixmap(24, 24)
+        mark.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(mark)
+        painter.setFont(QFont("Segoe MDL2 Assets", 14))
+        painter.setPen(QColor("#254133"))
+        painter.drawText(mark.rect(), Qt.AlignmentFlag.AlignCenter, "\ue721")
+        painter.end()
+        self.query.addAction(QIcon(mark), QLineEdit.ActionPosition.LeadingPosition)
         self.query.setClearButtonEnabled(True)
         self.query.setMaxLength(MAX_QUERY_CHARS)
         self.find_button = button("检索", "FindContent")
@@ -232,7 +269,7 @@ class SearchPage(QWidget):
         actions = QHBoxLayout()
         actions.addWidget(self.query, 1)
         actions.addWidget(self.find_button)
-        actions.addWidget(self.ask_button)
+
         layout.addLayout(actions)
 
         self.mode = QComboBox(self)
@@ -265,9 +302,20 @@ class SearchPage(QWidget):
         modes.idClicked.connect(self.mode.setCurrentIndex)
         self.mode.currentIndexChanged.connect(lambda index: modes.button(index).setChecked(True))
         filters.addStretch()
+        filters.addWidget(self.ask_button)
+        options = button("筛选", "FilterOptions")
+        options.setCheckable(True)
+        filters.addWidget(options)
+        advanced = QWidget()
+        advanced_row = QHBoxLayout(advanced)
+        advanced_row.setContentsMargins(0, 0, 0, 0)
         for widget in (self.extension, self.source, self.scope_button):
-            filters.addWidget(widget)
+            advanced_row.addWidget(widget)
+        advanced_row.addStretch()
+        options.toggled.connect(advanced.setVisible)
+        advanced.hide()
         layout.addLayout(filters)
+        layout.addWidget(advanced)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.setChildrenCollapsible(False)
@@ -277,7 +325,15 @@ class SearchPage(QWidget):
         layout = QVBoxLayout(results_panel)
         layout.setContentsMargins(0, 8, 10, 0)
         self.note = label("输入检索词，查看相关文件。", "Hint", wrap=True)
-        layout.addWidget(self.note)
+        summary_row = QHBoxLayout()
+        summary_row.addWidget(self.note, 1)
+        self.sort = QComboBox()
+        self.sort.setAccessibleName("检索结果排序")
+        self.sort.addItems(["按相关度排序", "按文件名排序", "按修改时间排序"])
+        self.last_search = None
+        self.sort.currentIndexChanged.connect(self.reorder)
+        summary_row.addWidget(self.sort)
+        layout.addLayout(summary_row)
         self.answer = QPlainTextEdit()
         self.answer.setObjectName("AnswerText")
         self.answer.setAccessibleName("问答内容")
@@ -379,7 +435,13 @@ class SearchPage(QWidget):
                 f"指定 {len(self.file_ids)} 份" if self.file_ids else "全部文件"
             )
 
+    def reorder(self):
+        if self.last_search is not None:
+            self.show_search(self.last_search)
+
     def clear_results(self) -> None:
+        self.last_search = None
+        self.sort.hide()
         self.results.clear()
         self.answer.clear()
         self.answer.hide()
@@ -388,13 +450,16 @@ class SearchPage(QWidget):
     def show_search(self, result: SearchResult) -> None:
         self.clear_results()
         self.result_delegate.term = self.query.text().strip()
-        summary = (
-            f"{MODE[result.mode]} · 显示 {len(result.hits)} 条结果"
-            if result.hits
-            else "未找到匹配文件。"
-        )
+        self.last_search = result
+        self.sort.setVisible(bool(result.hits))
+        summary = f"找到 {len(result.hits)} 个相关文件" if result.hits else "未找到匹配文件。"
         self.note.setText(" ".join(filter(None, (summary, result.notice))))
-        for hit in result.hits:
+        hits = result.hits
+        if self.sort.currentIndex() == 1:
+            hits = sorted(hits, key=lambda hit: hit.file.name.casefold())
+        elif self.sort.currentIndex() == 2:
+            hits = sorted(hits, key=lambda hit: hit.file.modified_ns or 0, reverse=True)
+        for hit in hits:
             copies = f" · 共 {hit.copies} 份相同内容" if hit.copies > 1 else ""
             if hit.passages:
                 passage = hit.passages[0]

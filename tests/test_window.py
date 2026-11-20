@@ -235,3 +235,51 @@ def test_desktop_import_search_and_open_citation(
         assert len(requests) == 2
     finally:
         close_window(window)
+
+
+def test_pdf_result_opens_physical_page_and_reader_controls(app: QApplication, tmp_path: Path):
+    from samples.materialize import write_pdf
+
+    source = tmp_path / "课程笔记.pdf"
+    write_pdf(source, ["Contents", "Scheduling"])
+
+    paths = AppPaths.resolve(tmp_path / "app")
+    paths.prepare()
+    store = LocalStore(paths.database)
+    window = MainWindow(paths, store, store.initialize())
+    try:
+        window.library.import_files([source])
+        window.show()
+        window.navigation.setCurrentRow(1)
+        page = window.search_page
+        page.query.setText("Scheduling")
+        page.mode.setCurrentIndex(1)
+        page.find_button.click()
+        wait_for_task(window)
+        reader = window.pdf
+
+        def wait_for_page():
+            for _ in range(400):
+                QTest.qWait(25)
+                if reader.process is None:
+                    break
+            assert not reader.image.isNull()
+
+        wait_for_page()
+        assert reader.isVisible()
+        assert reader.page.count() == 2
+        assert reader.page.currentIndex() == 1
+        assert not reader.next.isEnabled()
+        reader.previous.click()
+        assert reader.page.currentIndex() == 0
+        wait_for_page()
+        reader.zoom(1.25)
+        assert reader.scale == 1.25
+        reader.fullscreen()
+        assert reader.dialog.isFullScreen()
+        reader.dialog.reject()
+        assert reader.dialog is None and reader.view.parentWidget() == reader
+        window.navigation.setCurrentRow(0)
+        assert reader.page.count() == 0
+    finally:
+        close_window(window)
