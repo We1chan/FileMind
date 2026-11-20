@@ -225,5 +225,13 @@ def test_desktop_import_search_and_open_citation(
         assert window.preview.isVisible()
         assert "第 1 行" in window.detail_hint.text()
         assert window.preview.toPlainText() == source.read_text(encoding="utf-8")
+        monkeypatch.setattr(
+            "filemind.ui.window.QInputDialog.getText", lambda *args: ("FIRST/FOLLOW", True)
+        )
+        citation_file_id = window._result_file().id
+        window.ask_file.click()
+        wait_for_task(window)
+        assert window.search_page.file_ids == (citation_file_id,)
+        assert len(requests) == 2
     finally:
         close_window(window)

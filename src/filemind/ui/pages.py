@@ -1,10 +1,13 @@
 """Qt widgets for browsing, searching and checking index status."""
 
+from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QColor, QTextDocument
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -18,6 +21,9 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
+    QStyle,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
@@ -168,6 +174,45 @@ class LibraryPage(QWidget):
         self.retry_button.setEnabled(selected is not None and selected.status != "ready")
 
 
+class ResultDelegate(QStyledItemDelegate):
+    """Draw the same accessible item text as a file heading, location and excerpt."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.term = ""
+
+    def sizeHint(self, option, index):
+        return QSize(180, 113)
+
+    def paint(self, painter, option, index):
+        lines = index.data().split("\n", 2)
+        name, info = lines[:2]
+        selected = option.state & QStyle.StateFlag.State_Selected
+        painter.save()
+        painter.fillRect(option.rect, QColor("#e0eadb" if selected else "#faf9f5"))
+        painter.setPen(QColor("#daddd2"))
+        painter.drawLine(option.rect.bottomLeft(), option.rect.bottomRight())
+        rect = option.rect.adjusted(12, 9, -12, -8)
+        painter.setClipRect(rect)
+        painter.translate(rect.topLeft())
+        document = QTextDocument()
+        document.setDefaultFont(option.font)
+        document.setTextWidth(rect.width())
+        title = option.fontMetrics.elidedText(name, Qt.TextElideMode.ElideMiddle, rect.width() - 55)
+        excerpt = escape(lines[2]) if len(lines) > 2 else ""
+        term = escape(self.term)
+        if term:
+            excerpt = excerpt.replace(term, f'<span style="background:#f1d896">{term}</span>')
+        ext = escape(Path(name).suffix[1:8].upper())
+        document.setHtml(
+            f'<span style="color:#46674d;font-size:9pt">{ext}</span> &nbsp;'
+            f'<b style="color:#173c2a;font-size:12pt">{escape(title)}</b><br>'
+            f'<span style="color:#59675b">{escape(info)}</span><br>{excerpt}'
+        )
+        document.drawContents(painter)
+        painter.restore()
+
+
 class SearchPage(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -179,8 +224,9 @@ class SearchPage(QWidget):
         self.query.setObjectName("SearchQuery")
         self.query.setAccessibleName("检索词或问题")
         self.query.setPlaceholderText("输入关键词或问题")
+        self.query.setClearButtonEnabled(True)
         self.query.setMaxLength(MAX_QUERY_CHARS)
-        self.find_button = button("搜索", "FindContent")
+        self.find_button = button("检索", "FindContent")
         self.find_button.setProperty("primary", True)
         self.ask_button = button("问答", "AskQuestion")
         actions = QHBoxLayout()
@@ -189,7 +235,8 @@ class SearchPage(QWidget):
         actions.addWidget(self.ask_button)
         layout.addLayout(actions)
 
-        self.mode = QComboBox()
+        self.mode = QComboBox(self)
+        self.mode.hide()
         self.mode.setAccessibleName("检索模式")
         for key, name in MODE.items():
             self.mode.addItem(name, key)
@@ -207,12 +254,29 @@ class SearchPage(QWidget):
         self.scope_button.setAccessibleName("选择检索和问答范围")
         self.file_ids: tuple[int, ...] | None = None
         filters = QHBoxLayout()
-        for widget in (self.mode, self.extension, self.source, self.scope_button):
-            filters.addWidget(widget)
+        filters.addWidget(label("检索模式", "Hint"))
+        modes = QButtonGroup(self)
+        for index, title in enumerate(("混合", "关键词", "语义", "文件名")):
+            choice = button(title, "ModeChoice")
+            choice.setCheckable(True)
+            choice.setChecked(index == 0)
+            modes.addButton(choice, index)
+            filters.addWidget(choice)
+        modes.idClicked.connect(self.mode.setCurrentIndex)
+        self.mode.currentIndexChanged.connect(lambda index: modes.button(index).setChecked(True))
         filters.addStretch()
+        for widget in (self.extension, self.source, self.scope_button):
+            filters.addWidget(widget)
         layout.addLayout(filters)
 
-        self.note = label("", "Hint", wrap=True)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        layout.addWidget(self.splitter, 1)
+        results_panel = QWidget()
+        self.splitter.addWidget(results_panel)
+        layout = QVBoxLayout(results_panel)
+        layout.setContentsMargins(0, 8, 10, 0)
+        self.note = label("输入检索词，查看相关文件。", "Hint", wrap=True)
         layout.addWidget(self.note)
         self.answer = QPlainTextEdit()
         self.answer.setObjectName("AnswerText")
@@ -222,6 +286,8 @@ class SearchPage(QWidget):
         self.answer.hide()
         layout.addWidget(self.answer)
         self.results = _list("SearchResults", "检索结果与问答引用")
+        self.result_delegate = ResultDelegate(self.results)
+        self.results.setItemDelegate(self.result_delegate)
         layout.addWidget(self.results, 1)
         self.locate_button = button("定位选中文件", "LocateResult")
         self.locate_button.setEnabled(False)
@@ -321,6 +387,7 @@ class SearchPage(QWidget):
 
     def show_search(self, result: SearchResult) -> None:
         self.clear_results()
+        self.result_delegate.term = self.query.text().strip()
         summary = (
             f"{MODE[result.mode]} · 显示 {len(result.hits)} 条结果"
             if result.hits
@@ -339,8 +406,12 @@ class SearchPage(QWidget):
                     hit.file,
                 )
 
+        if self.results.count():
+            self.results.setCurrentRow(0)
+
     def show_answer(self, result: Answer) -> None:
         self.clear_results()
+        self.result_delegate.term = ""
         self.note.setText(result.notice or "选择引用可查看对应原文。")
         if result.text:
             self.answer.setPlainText(result.text)

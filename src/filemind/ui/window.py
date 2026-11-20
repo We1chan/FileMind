@@ -11,7 +11,15 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl
-from PySide6.QtGui import QCloseEvent, QDesktopServices, QTextCursor
+from PySide6.QtGui import (
+    QCloseEvent,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QPainter,
+    QPixmap,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -19,6 +27,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -152,7 +161,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("FileMind")
         self.setWindowIcon(application_icon())
         self.setMinimumSize(920, 580)
-        self.resize(1160, 700)
+        self.resize(1280, 780)
         self.setStyleSheet(WINDOW_STYLE)
 
         self.navigation = QListWidget()
@@ -173,6 +182,20 @@ class MainWindow(QMainWindow):
         bodies = (self.library_page, self.search_page, None, self.settings_page)
         for page, body in zip(PAGES, bodies, strict=True):
             item = QListWidgetItem(page.title)
+            symbols = {
+                "library": "\ue8b7",
+                "search": "\ue721",
+                "organize": "\ue81e",
+                "settings": "\ue713",
+            }
+            mark = QPixmap(24, 24)
+            mark.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(mark)
+            painter.setPen(Qt.GlobalColor.white)
+            painter.setFont(QFont("Segoe MDL2 Assets", 13))
+            painter.drawText(mark.rect(), Qt.AlignmentFlag.AlignCenter, symbols[page.key])
+            painter.end()
+            item.setIcon(QIcon(mark))
             item.setSizeHint(QSize(0, 43))
             self.navigation.addItem(item)
             self.pages.addWidget(self._make_page(page, body))
@@ -266,10 +289,12 @@ class MainWindow(QMainWindow):
         content.setContentsMargins(24, 24, 22, 24)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(13)
+        self.workspace_splitter = splitter
+        splitter.setHandleWidth(8)
         splitter.addWidget(self.pages)
 
         detail = QFrame()
+        self.detail_panel = detail
         detail.setObjectName("Card")
         detail.setMinimumWidth(218)
         detail_layout = QVBoxLayout(detail)
@@ -278,7 +303,10 @@ class MainWindow(QMainWindow):
         detail_layout.addWidget(self.detail_title)
         detail_layout.addWidget(self.detail_hint)
         detail_layout.addWidget(self.preview, 1)
-        detail_layout.addStretch()
+        self.ask_file = button("基于此文件提问", "AskFile")
+        self.ask_file.clicked.connect(self._ask_file)
+        detail_layout.addWidget(self.ask_file)
+        detail_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         splitter.addWidget(detail)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 1)
@@ -296,12 +324,12 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(15, 24, 15, 18)
         layout.setSpacing(21)
 
-        brand = QHBoxLayout()
+        brand = QVBoxLayout()
         brand.setSpacing(9)
         icon = QLabel()
         icon.setPixmap(self.windowIcon().pixmap(31, 31))
-        brand.addWidget(icon)
-        brand.addWidget(label("FileMind", "Brand"), 1)
+        brand.addWidget(icon, alignment=Qt.AlignmentFlag.AlignHCenter)
+        brand.addWidget(label("FileMind", "Brand"), alignment=Qt.AlignmentFlag.AlignHCenter)
         layout.addLayout(brand)
         layout.addWidget(self.navigation, 1)
         layout.addWidget(label(f"版本 {__version__}", "Version"))
@@ -313,7 +341,8 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 1, 0, 0)
         layout.setSpacing(7)
         layout.addWidget(label(page.title, "PageTitle"))
-        layout.addWidget(label(page.description, "Hint", wrap=True))
+        if page.key != "search":
+            layout.addWidget(label(page.description, "Hint", wrap=True))
         layout.addSpacing(10)
         layout.addWidget(body if body is not None else self._make_empty_state(page), 1)
         return widget
@@ -334,10 +363,19 @@ class MainWindow(QMainWindow):
 
     def _show_page(self, index: int) -> None:
         page = PAGES[index]
+        searching = page.key == "search"
+        target = self.search_page.splitter if searching else self.workspace_splitter
+        if self.detail_panel.parentWidget() is not target:
+            target.addWidget(self.detail_panel)
+            target.setSizes([450, 560] if searching else [650, 300])
+        self.ask_file.setVisible(searching)
+        self.ask_file.setEnabled(self._result_file() is not None)
         self.pages.setCurrentIndex(index)
         self._reset_detail()
         if page.key == "library":
             self._file_detail()
+        elif searching and self.search_page.results.currentItem() is not None:
+            self._preview_citation(self.search_page.results.currentItem())
         elif page.key == "settings":
             self._task_detail()
             self.settings_page.model_status.setText(self.search.semantic.status)
@@ -383,7 +421,12 @@ class MainWindow(QMainWindow):
         search.ask_button.clicked.connect(lambda: self._search(True))
         search.scope_button.clicked.connect(lambda: search.choose_scope(self.store))
         search.locate_button.clicked.connect(lambda: self._locate(self._result_file()))
-        search.results.itemClicked.connect(self._preview_citation)
+        search.results.currentItemChanged.connect(
+            lambda current, _: self.ask_file.setEnabled(current is not None)
+        )
+        search.results.currentItemChanged.connect(
+            lambda current, _: self._preview_citation(current) if current else None
+        )
         search.results.itemActivated.connect(self._preview_citation)
 
         settings = self.settings_page
@@ -778,6 +821,19 @@ class MainWindow(QMainWindow):
             lambda _: self.library.preview(passage.chunk_id, passage.file.version),
             lambda verified: self._show_preview(verified, 1, citation.quote),
         )
+
+    def _ask_file(self) -> None:
+        file = self._result_file()
+        if file is None:
+            return
+        page = self.search_page
+        question, accepted = QInputDialog.getText(self, "基于此文件提问", file.name)
+        if not accepted or not question.strip():
+            return
+        page.file_ids = (file.id,)
+        page.scope_button.setText("指定 1 份")
+        page.query.setText(question.strip())
+        self._search(True)
 
     def _result_file(self) -> FileRecord | None:
         item = self.search_page.results.currentItem()
