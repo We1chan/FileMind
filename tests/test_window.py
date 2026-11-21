@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QPushButton
 
 from filemind.config import AppPaths
 from filemind.storage import LocalStore
+from filemind.ui.pages import PAGE_COUNT_ROLE
 from filemind.ui.window import MainWindow
 
 
@@ -127,6 +128,7 @@ from win32gui import IsWindowVisible
 
 from filemind.config import AppPaths
 from filemind.storage import LocalStore
+from filemind.ui.pages import PAGE_COUNT_ROLE
 from filemind.ui.window import MainWindow
 
 app = QApplication([])
@@ -199,7 +201,7 @@ def test_desktop_import_search_and_open_citation(
         assert window.search_page.results.count() == 1
         assert "语义检索未启用" in window.search_page.note.text()
 
-        QTest.mouseClick(window.search_page.ask_button, Qt.MouseButton.LeftButton)
+        window.search_page.ask_action.trigger()
         wait_for_task(window)
         assert "原文摘录" in window.search_page.note.text()
         assert not requests
@@ -208,7 +210,7 @@ def test_desktop_import_search_and_open_citation(
         assert window.settings_page.remote.isEnabled()
         window.settings_page.remote.click()
         click_navigation(window, 1)
-        QTest.mouseClick(window.search_page.ask_button, Qt.MouseButton.LeftButton)
+        window.search_page.ask_action.trigger()
         wait_for_task(window)
         assert requests == [("mock", "FIRST/FOLLOW")]
         assert window.search_page.answer.isVisible()
@@ -268,6 +270,7 @@ def test_pdf_result_opens_physical_page_and_reader_controls(app: QApplication, t
         wait_for_page()
         assert reader.isVisible()
         assert reader.page.count() == 2
+        assert page.results.currentItem().data(PAGE_COUNT_ROLE) == 2
         assert reader.page.currentIndex() == 1
         assert not reader.next.isEnabled()
         reader.previous.click()

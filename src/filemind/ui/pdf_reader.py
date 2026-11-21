@@ -2,11 +2,11 @@
 
 import sys
 
-from PySide6.QtCore import QEvent, QProcess, Qt, QTimer, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QEvent, QProcess, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
-    QComboBox,
     QDialog,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QScrollArea,
@@ -15,10 +15,12 @@ from PySide6.QtWidgets import (
 )
 
 from filemind.ui.pages import button, label
+from filemind.ui.theme import ChevronComboBox, line_icon
 
 
 class PdfReader(QWidget):
     render_failed = Signal()
+    page_count_found = Signal(int)
 
     def __init__(self):
         super().__init__()
@@ -28,42 +30,65 @@ class PdfReader(QWidget):
         self.scale = 1.0
         self.image = QPixmap()
         self.view = QScrollArea()
+        self.view.setObjectName("PaperView")
+        self.view.setViewportMargins(18, 9, 18, 13)
+        self.view.viewport().setObjectName("PaperSurface")
         self.view.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.view.setAccessibleName("PDF 原始页面")
         self.paper = QLabel()
+        self.paper.setObjectName("RenderedPaper")
+        shadow = QGraphicsDropShadowEffect(self.paper)
+        shadow.setBlurRadius(8)
+        shadow.setOffset(0, 1)
+        shadow.setColor(QColor(30, 35, 26, 45))
+        self.paper.setGraphicsEffect(shadow)
         self.paper.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.view.setWidget(self.paper)
         self.view.viewport().installEventFilter(self)
-        self.setMinimumWidth(246)
+        self.setMinimumWidth(312)
         self.layout_box = QVBoxLayout(self)
         self.layout_box.setContentsMargins(0, 0, 0, 0)
+        self.layout_box.setSpacing(0)
         self.toolbar = QWidget()
+        self.toolbar.setObjectName("ReaderToolbar")
+        self.toolbar.setMinimumHeight(48)
         row = QHBoxLayout(self.toolbar)
-        row.setContentsMargins(0, 4, 0, 4)
+        row.setContentsMargins(20, 4, 15, 4)
+        row.setSpacing(9)
+        self.book = QLabel()
+        self.book.setPixmap(line_icon("book").pixmap(QSize(24, 24), self.devicePixelRatioF()))
         self.heading = label("原文预览", "SectionTitle")
+        row.addWidget(self.book)
         row.addWidget(self.heading)
         row.addStretch()
         self.previous = self.control(
-            row, "‹", "上一页", lambda: self.page.setCurrentIndex(self.page.currentIndex() - 1)
+            row,
+            "previous",
+            "上一页",
+            lambda: self.page.setCurrentIndex(self.page.currentIndex() - 1),
         )
-        self.page = QComboBox()
+        self.page = ChevronComboBox()
+        self.page.setFixedWidth(96)
+        self.page.setObjectName("ReaderPage")
         self.page.setMinimumContentsLength(3)
         self.page.setAccessibleName("物理页码")
         row.addWidget(self.page)
         self.next = self.control(
-            row, "›", "下一页", lambda: self.page.setCurrentIndex(self.page.currentIndex() + 1)
+            row, "next", "下一页", lambda: self.page.setCurrentIndex(self.page.currentIndex() + 1)
         )
         row.addStretch()
-        self.control(row, "−", "缩小", lambda: self.zoom(0.8))
-        self.control(row, "＋", "放大", lambda: self.zoom(1.25))
-        self.control(row, "⛶", "全屏阅读", self.fullscreen)
+        self.control(row, "zoom_out", "缩小", lambda: self.zoom(0.8))
+        self.control(row, "zoom_in", "放大", lambda: self.zoom(1.25))
+        self.control(row, "fullscreen", "全屏阅读", self.fullscreen)
         self.layout_box.addWidget(self.toolbar)
         self.layout_box.addWidget(self.view, 1)
         self.page.currentIndexChanged.connect(self.jump)
         self.dialog = None
 
     def control(self, layout, symbol, name, callback):
-        action = button(symbol, "ReaderTool")
+        action = button("", "ReaderTool")
+        action.setIcon(line_icon(symbol))
+        action.setIconSize(QSize(23, 23))
         action.setAccessibleName(name)
         action.setToolTip(name)
         action.clicked.connect(callback)
@@ -130,6 +155,7 @@ class PdfReader(QWidget):
             if self.page.count() != count:
                 self.page.clear()
                 self.page.addItems([f"第 {i + 1} 页" for i in range(count)])
+                self.page_count_found.emit(count)
             self.page.setCurrentIndex(number - 1)
             self.page.blockSignals(False)
             self.previous.setEnabled(number > 1)
@@ -160,7 +186,9 @@ class PdfReader(QWidget):
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.Resize:
-            self.heading.setVisible(event.size().width() >= 350)
+            show_heading = event.size().width() >= 410
+            self.heading.setVisible(show_heading)
+            self.book.setVisible(show_heading)
             self.fit()
         return super().eventFilter(obj, event)
 

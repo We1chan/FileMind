@@ -47,6 +47,45 @@ def set_title_bar_colors(hwnd: int, colors: tuple[str, str] | None) -> None:
         set_color(_DWMWA_CAPTION_COLOR, _DWMWA_COLOR_DEFAULT)
 
 
+def expanded_caption_hit(message: int, *, maximized: bool) -> int | None:
+    """Expose Qt's expanded caption to Windows hit testing, including Snap hover."""
+    from ctypes import wintypes
+
+    from win32con import HTCAPTION, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, WM_NCHITTEST
+    from win32gui import ClientToScreen, GetClientRect
+
+    event = wintypes.MSG.from_address(message)
+    if event.message != WM_NCHITTEST:
+        return None
+
+    user = ctypes.WinDLL("user32.dll", winmode=0x800)
+    get_dpi = user.GetDpiForWindow
+    get_dpi.argtypes = (wintypes.HWND,)
+    get_dpi.restype = wintypes.UINT
+    dpi = get_dpi(event.hWnd)
+    metrics = user.GetSystemMetricsForDpi
+    # These metrics also size the caption painted by the Qt Windows platform plugin.
+    border = metrics(32, dpi) + metrics(92, dpi)  # SM_CXSIZEFRAME + SM_CXPADDEDBORDER
+    height = border + metrics(4, dpi)  # SM_CYCAPTION
+    buttons = height * 3 // 2
+    left, top = ClientToScreen(event.hWnd, (0, 0))
+    width = GetClientRect(event.hWnd)[2]
+    x = ctypes.c_short(event.lParam & 0xFFFF).value - left
+    y = ctypes.c_short((event.lParam >> 16) & 0xFFFF).value - top
+    edge = 0 if maximized else border
+    if not (edge <= x < width - edge and edge <= y < height):
+        return None
+
+    right = width - 1 - x
+    if right < buttons:
+        return HTCLOSE
+    if right < buttons * 2:
+        return HTMAXBUTTON
+    if right < buttons * 3:
+        return HTMINBUTTON
+    return HTCAPTION
+
+
 def _known_folder(identifier: str) -> Path | None:
     from ctypes import wintypes
 
