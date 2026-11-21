@@ -3,6 +3,8 @@
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPixmap
 
+TITLE_BAR_COLORS = ("#133b2c", "#ecf1e6")
+
 WINDOW_STYLE = """
 QWidget#Shell { background: #faf8f3; color: #1c3026; }
 QFrame#Sidebar { background: #133b2c; }

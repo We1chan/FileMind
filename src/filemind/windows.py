@@ -1,4 +1,4 @@
-"""Windows source presets and per-user startup registration."""
+"""Windows integration for the desktop app."""
 
 import ctypes
 import os
@@ -11,6 +11,40 @@ from filemind.config import AppPaths
 
 _RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _VALUE = "FileMind"
+
+_DWMWA_CAPTION_COLOR = 35
+_DWMWA_TEXT_COLOR = 36
+_DWMWA_COLOR_DEFAULT = 0xFFFFFFFF
+
+
+def set_title_bar_colors(hwnd: int, colors: tuple[str, str] | None) -> None:
+    """Set native caption and text colors from #RRGGBB, or restore system colors."""
+    if os.name != "nt" or sys.getwindowsversion().build < 22000:
+        return
+
+    from ctypes import wintypes
+
+    set_attribute = ctypes.WinDLL("dwmapi.dll", winmode=0x800).DwmSetWindowAttribute
+    set_attribute.argtypes = (
+        wintypes.HWND,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.DWORD,
+    )
+    set_attribute.restype = ctypes.c_long
+
+    def set_color(attribute: int, value: int) -> bool:
+        color = wintypes.DWORD(value)
+        return set_attribute(hwnd, attribute, ctypes.byref(color), ctypes.sizeof(color)) >= 0
+
+    if colors is None:
+        set_color(_DWMWA_CAPTION_COLOR, _DWMWA_COLOR_DEFAULT)
+        set_color(_DWMWA_TEXT_COLOR, _DWMWA_COLOR_DEFAULT)
+        return
+
+    caption, text = (int.from_bytes(bytes.fromhex(color[1:]), "little") for color in colors)
+    if set_color(_DWMWA_CAPTION_COLOR, caption) and not set_color(_DWMWA_TEXT_COLOR, text):
+        set_color(_DWMWA_CAPTION_COLOR, _DWMWA_COLOR_DEFAULT)
 
 
 def _known_folder(identifier: str) -> Path | None:

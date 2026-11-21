@@ -18,6 +18,7 @@ from PySide6.QtGui import (
     QIcon,
     QPainter,
     QPixmap,
+    QShowEvent,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -62,8 +63,13 @@ from filemind.ui.pages import (
     label,
 )
 from filemind.ui.pdf_reader import PdfReader
-from filemind.ui.theme import WINDOW_STYLE, application_icon
-from filemind.windows import common_locations, set_startup, starts_with_windows
+from filemind.ui.theme import TITLE_BAR_COLORS, WINDOW_STYLE, application_icon
+from filemind.windows import (
+    common_locations,
+    set_startup,
+    set_title_bar_colors,
+    starts_with_windows,
+)
 
 LAST_PAGE = "last_page"
 
@@ -164,6 +170,14 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(920, 580)
         self.resize(1280, 780)
         self.setStyleSheet(WINDOW_STYLE)
+        # Keep the PySide wrapper alive with its accessibility hints child.
+        self._style_hints = (
+            QApplication.styleHints() if QApplication.platformName() == "windows" else None
+        )
+        if self._style_hints is not None:
+            self._style_hints.accessibility().contrastPreferenceChanged.connect(
+                self._update_title_bar
+            )
 
         self.navigation = QListWidget()
         self.navigation.setObjectName("Navigation")
@@ -227,6 +241,16 @@ class MainWindow(QMainWindow):
             self._updates.start()
         elif self.library_page.files.count() or self.settings_page.tasks.count():
             self._refresh()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        if self._style_hints is not None:
+            self._update_title_bar(self._style_hints.accessibility().contrastPreference())
+
+    def _update_title_bar(self, contrast: Qt.ContrastPreference) -> None:
+        if self.isVisible() and (handle := self.windowHandle()) is not None:
+            colors = None if contrast == Qt.ContrastPreference.HighContrast else TITLE_BAR_COLORS
+            set_title_bar_colors(int(handle.winId()), colors)
 
     def _setup_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
