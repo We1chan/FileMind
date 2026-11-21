@@ -467,7 +467,7 @@ class SearchPage(QWidget):
         self.sort.setAccessibleName("检索结果排序")
         self.sort.addItems(["按相关度排序", "按文件名排序", "按修改时间排序"])
         self.last_search = None
-        self.sort.currentIndexChanged.connect(self.reorder)
+        self.sort.currentIndexChanged.connect(self._sort_changed)
         self.sort.hide()
         summary_row.addWidget(self.sort)
         layout.addWidget(summary)
@@ -580,7 +580,8 @@ class SearchPage(QWidget):
                 f"指定 {len(self.file_ids)} 份" if self.file_ids else "全部文件"
             )
 
-    def reorder(self):
+    def _sort_changed(self, index: int) -> None:
+        self.sort.setFixedWidth(144 if index == 2 else 124)
         if self.last_search is not None:
             self.show_search(self.last_search)
 

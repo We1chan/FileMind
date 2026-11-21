@@ -444,6 +444,8 @@ class MainWindow(QMainWindow):
         self.detail_panel.style().polish(self.detail_panel)
         self.detail_layout.setContentsMargins(*((0, 0, 0, 0) if searching else (18, 20, 18, 20)))
         self.detail_layout.setSpacing(0 if searching else 10)
+        self.detail_title.setContentsMargins(*((20, 10, 16, 5) if searching else (0, 0, 0, 0)))
+        self.detail_hint.setContentsMargins(*((20, 2, 18, 8) if searching else (0, 0, 0, 0)))
         self.ask_footer.setVisible(searching)
         self.ask_file.setEnabled(self._result_file() is not None)
         self.pages.setCurrentIndex(index)

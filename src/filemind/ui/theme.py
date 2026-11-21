@@ -151,8 +151,6 @@ QPushButton#AskFile {
 }
 QPushButton#AskFile:hover:enabled { background: #e6edde; }
 QPushButton#AskFile:disabled { color: #647369; border-color: #acb9ac; }
-QFrame#SearchDetail QLabel#Hint { padding: 10px 18px; }
-QFrame#SearchDetail > QLabel#SectionTitle { padding: 9px 20px; }
 QPlainTextEdit#SourcePreview {
     font-family: "SimSun"; font-size: 17px; padding: 14px;
     selection-background-color: #f2d998; selection-color: #23392c;
