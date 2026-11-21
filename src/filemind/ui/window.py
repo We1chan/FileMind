@@ -682,6 +682,7 @@ class MainWindow(QMainWindow):
                 self._shutdown_task.start()
             event.ignore()
             return
+        self.pdf.reset()
         super().closeEvent(event)
         if self.tray is not None:
             QApplication.quit()
@@ -695,6 +696,7 @@ class MainWindow(QMainWindow):
         self.close()
 
     def shutdown(self) -> None:
+        self.pdf.reset()
         self.closing = True
         self._filter_delay.stop()
         if self.catalog_task is not None:

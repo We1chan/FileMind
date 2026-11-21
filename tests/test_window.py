@@ -342,5 +342,16 @@ def test_pdf_result_opens_physical_page_and_reader_controls(app: QApplication, t
         window.navigation.setCurrentRow(0)
         assert reader.page.count() == 0
         assert reader.process is None
+        window.navigation.setCurrentRow(1)
+        wait_for_task(window)
+        wait_for_page()
+        assert reader.process is not None
+        window.close()
+        for _ in range(200):
+            if not window.isVisible():
+                break
+            QTest.qWait(20)
+        assert not window.isVisible()
+        assert reader.process is None
     finally:
         close_window(window)
