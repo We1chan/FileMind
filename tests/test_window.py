@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from threading import Event
 
 import pytest
 from PySide6.QtCore import QEvent, QEventLoop, Qt, QTimer, QUrl
@@ -86,13 +87,16 @@ def test_settings_opens_the_configured_data_directory(
 
 
 def wait_for_task(window: MainWindow) -> None:
-    if window.task is None:
+    def busy() -> bool:
+        return window.task is not None or window.catalog_task is not None
+
+    if not busy():
         return
     loop = QEventLoop()
     poll = QTimer()
 
     def check() -> None:
-        if window.task is None:
+        if not busy():
             loop.quit()
 
     poll.timeout.connect(check)
@@ -102,7 +106,7 @@ def wait_for_task(window: MainWindow) -> None:
     timeout.timeout.connect(loop.quit)
     timeout.start(10_000)
     loop.exec()
-    assert window.task is None, "FileMind background task did not finish"
+    assert not busy(), "FileMind background task did not finish"
 
 
 def close_window(window: MainWindow) -> None:
@@ -110,6 +114,53 @@ def close_window(window: MainWindow) -> None:
     wait_for_task(window)
     window.deleteLater()
     QApplication.sendPostedEvents(window, QEvent.Type.DeferredDelete)
+
+
+def test_library_filter_discards_a_slow_obsolete_query(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = AppPaths.resolve(tmp_path)
+    paths.prepare()
+    store = LocalStore(paths.database)
+    window = MainWindow(paths, store, store.initialize())
+    started, release = Event(), Event()
+    files = store.files
+    applied = []
+    show_files = window.library_page.show_files
+
+    def slower_files(**kwargs):
+        if kwargs.get("name") == "old":
+            started.set()
+            assert release.wait(10)
+        return files(**kwargs)
+
+    def record_files(records, counts, offset):
+        applied.append([file.name for file in records])
+        show_files(records, counts, offset)
+
+    try:
+        window.show()
+        wait_for_task(window)
+        store.register_file(None, Path("old.txt"), "old.txt")
+        store.register_file(None, Path("new.txt"), "new.txt")
+        monkeypatch.setattr(store, "files", slower_files)
+        monkeypatch.setattr(window.library_page, "show_files", record_files)
+        window.library_page.filter.setText("old")
+        for _ in range(100):
+            QTest.qWait(10)
+            if started.is_set():
+                break
+        assert started.is_set()
+        click_navigation(window, 3)
+        assert window.pages.currentIndex() == 3
+        window.library_page.filter.setText("new")
+        release.set()
+        QTest.qWait(200)
+        wait_for_task(window)
+        assert applied == [["new.txt"]]
+    finally:
+        release.set()
+        close_window(window)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows startup visibility")
@@ -261,11 +312,12 @@ def test_pdf_result_opens_physical_page_and_reader_controls(app: QApplication, t
         def wait_for_page():
             for _ in range(400):
                 QTest.qWait(25)
-                if reader.process is None:
+                if not reader.rendering:
                     break
             assert not reader.image.isNull()
 
         wait_for_page()
+        renderer = reader.process
         assert reader.isVisible()
         assert reader.page.count() == 2
         assert reader.page.currentIndex() == 1
@@ -273,6 +325,12 @@ def test_pdf_result_opens_physical_page_and_reader_controls(app: QApplication, t
         reader.previous.click()
         assert reader.page.currentIndex() == 0
         wait_for_page()
+        assert renderer is not None and reader.process is renderer
+        reader.page.setCurrentIndex(1)
+        reader.page.setCurrentIndex(0)
+        reader.page.setCurrentIndex(1)
+        wait_for_page()
+        assert reader.page.currentIndex() == 1 and reader.process is renderer
         reader.zoom(1.25)
         assert reader.scale == 1.25
         reader.fullscreen()
@@ -281,5 +339,6 @@ def test_pdf_result_opens_physical_page_and_reader_controls(app: QApplication, t
         assert reader.dialog is None and reader.view.parentWidget() == reader
         window.navigation.setCurrentRow(0)
         assert reader.page.count() == 0
+        assert reader.process is None
     finally:
         close_window(window)

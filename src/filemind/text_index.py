@@ -1,5 +1,7 @@
 """Use the BGE tokenizer for passage boundaries and jieba for FTS terms."""
 
+from __future__ import annotations
+
 import re
 from bisect import bisect_right
 from collections.abc import Iterator
@@ -7,12 +9,14 @@ from dataclasses import dataclass
 from functools import cache
 from itertools import accumulate
 from pathlib import Path
-
-import jieba
-from tokenizers import BertWordPieceTokenizer
+from typing import TYPE_CHECKING
 
 from filemind.config import checkout_data_dir, installed_data_dir
 from filemind.documents import EXTENSIONS, Section, line_location
+
+if TYPE_CHECKING:
+    import jieba
+    from tokenizers import BertWordPieceTokenizer
 
 MAX_MODEL_TOKENS = 512
 PASSAGE_TOKENS = 384
@@ -39,11 +43,15 @@ class TextChunk:
 
 @cache
 def bge_tokenizer() -> BertWordPieceTokenizer:
+    from tokenizers import BertWordPieceTokenizer
+
     return BertWordPieceTokenizer(str(VOCAB_PATH), lowercase=False)
 
 
 @cache
 def _jieba_tokenizer() -> jieba.Tokenizer:
+    import jieba
+
     directory = (checkout_data_dir() or installed_data_dir()) / "cache" / "jieba"
     directory.mkdir(parents=True, exist_ok=True)
     tokenizer = jieba.Tokenizer()
