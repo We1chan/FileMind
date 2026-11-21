@@ -1,5 +1,7 @@
 """Opt-in weight installation and local BGE inference with ONNX Runtime."""
 
+from __future__ import annotations
+
 import hashlib
 import heapq
 import logging
@@ -11,13 +13,15 @@ from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from threading import Lock
+from typing import TYPE_CHECKING
 from urllib.request import urlopen
-
-import numpy as np
-from numpy.typing import NDArray
 
 from filemind.storage import LocalStore, SearchScope
 from filemind.text_index import MAX_MODEL_TOKENS, bge_tokenizer
+
+if TYPE_CHECKING:
+    import numpy as np
+    from numpy.typing import NDArray
 
 MODEL_ID = "BAAI/bge-small-zh-v1.5"
 MODEL_URL = (
@@ -118,6 +122,8 @@ class BgeModel:
         return ort.InferenceSession(model, sess_options=options, providers=providers)
 
     def embed(self, texts: list[str]) -> NDArray[np.float32]:
+        import numpy as np
+
         tokenizer = bge_tokenizer()
         inputs = []
         for encoding in tokenizer.encode_batch(texts):
@@ -222,6 +228,8 @@ class SemanticIndex:
         populate: bool = True,
     ) -> list[tuple[int, int]]:
         model = self._load()
+        import numpy as np
+
         if populate:
             while not cancelled() and self.populate_batch(scope):
                 pass
@@ -309,6 +317,8 @@ class SemanticIndex:
         *,
         chunk_ids: list[int] | None = None,
     ) -> Iterator[_VectorBlock]:
+        import numpy as np
+
         with closing(self.store.embeddings(FINGERPRINT, scope, chunk_ids=chunk_ids)) as rows:
             while not cancelled() and (batch := list(islice(rows, RANK_BATCH))):
                 files, chunks, vectors = zip(*batch, strict=True)

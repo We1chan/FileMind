@@ -194,8 +194,13 @@ class LocalStore:
         self.database_path = database_path
         self.fts5_available = False
         self._change_lock = Lock()
+        self._catalog_revision = 0
         self._vector_revision = 0
         self._vector_updates: deque[tuple[int, tuple[int, ...]]] = deque(maxlen=64)
+
+    @property
+    def catalog_revision(self) -> int:
+        return self._catalog_revision
 
     @property
     def vector_revision(self) -> int:
@@ -337,7 +342,7 @@ class LocalStore:
             ]
 
     def register_source(self, path: Path, path_key: str) -> int:
-        with self._session() as connection:
+        with self._session(catalog_change=True) as connection:
             connection.execute(
                 "INSERT INTO sources(path, path_key) VALUES (?, ?) ON CONFLICT DO NOTHING",
                 (str(path), path_key),
@@ -347,15 +352,15 @@ class LocalStore:
             ).fetchone()[0]
 
     def update_source(self, source_id: int, status: str, reason: str = "") -> None:
-        with self._session() as connection:
+        with self._session(catalog_change=True) as connection:
             connection.execute(
-                "UPDATE sources SET status = ?, reason = ? WHERE id = ?",
-                (status, reason, source_id),
+                "UPDATE sources SET status = ?, reason = ? WHERE id = ? AND (status IS NOT ? OR reason IS NOT ?)",
+                (status, reason, source_id, status, reason),
             )
 
     def remove_source(self, source_id: int) -> None:
         changes = _VectorChanges()
-        with self._session(vector_changes=changes) as connection:
+        with self._session(catalog_change=True, vector_changes=changes) as connection:
             connection.execute("BEGIN IMMEDIATE")
             changes.deleted = self._has_vectors(
                 connection, "SELECT id FROM files WHERE source_id = ?", (source_id,)
@@ -380,7 +385,7 @@ class LocalStore:
         if not file_ids:
             return
         changes = _VectorChanges()
-        with self._session(vector_changes=changes) as connection:
+        with self._session(catalog_change=True, vector_changes=changes) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("CREATE TEMP TABLE excluded_files (id INTEGER PRIMARY KEY)")
             connection.executemany(
@@ -498,14 +503,14 @@ class LocalStore:
     def register_file(
         self, source_id: int | None, relative: Path, key: str, *, import_from: Path | None = None
     ) -> int:
-        with self._session() as connection:
+        with self._session(catalog_change=True) as connection:
             self._register_file(connection, source_id, relative, key, import_from)
             return connection.execute(
                 "SELECT id FROM files WHERE source_id IS ? AND path_key = ?", (source_id, key)
             ).fetchone()[0]
 
     def register_batch(self, source_id: int, batch: dict[str, Path]) -> None:
-        with self._session() as connection:
+        with self._session(catalog_change=True) as connection:
             for key, relative in batch.items():
                 self._register_file(connection, source_id, relative, key, None)
 
@@ -542,7 +547,7 @@ class LocalStore:
             connection.execute("INSERT OR IGNORE INTO preferences VALUES ('fts5_dirty', '1')")
 
     def complete_import(self, file_id: int) -> None:
-        with self._session() as connection:
+        with self._session(catalog_change=True) as connection:
             connection.execute(
                 "UPDATE files SET import_from = NULL, status = 'pending', reason = '' WHERE id = ?",
                 (file_id,),
@@ -550,7 +555,7 @@ class LocalStore:
 
     def unavailable(self, file_id: int, status: str, reason: str) -> None:
         changes = _VectorChanges()
-        with self._session(vector_changes=changes) as connection:
+        with self._session(catalog_change=True, vector_changes=changes) as connection:
             connection.execute("BEGIN IMMEDIATE")
             changes.deleted = self._delete_sections(connection, file_id)
             connection.execute(
@@ -560,7 +565,7 @@ class LocalStore:
             )
 
     def update_file_stat(self, file_id: int, fingerprint: tuple[int, int, int, str]) -> None:
-        with self._session() as connection:
+        with self._session(catalog_change=True) as connection:
             connection.execute(
                 "UPDATE files SET size = ?, modified_ns = ?, changed_ns = ?, identity = ? WHERE id = ?",
                 (*fingerprint, file_id),
@@ -575,7 +580,7 @@ class LocalStore:
         parser_version: int = 0,
     ) -> int:
         changes = _VectorChanges()
-        with self._session(vector_changes=changes) as connection:
+        with self._session(catalog_change=True, vector_changes=changes) as connection:
             connection.execute("BEGIN IMMEDIATE")
             changes.deleted = self._delete_sections(connection, file_id)
             return connection.execute(
@@ -596,7 +601,7 @@ class LocalStore:
         name_terms: str,
         sections: list[tuple[Section, list[TextChunk]]],
     ) -> None:
-        with self._session() as connection:
+        with self._session(catalog_change=True) as connection:
             updated = connection.execute(
                 "UPDATE files SET status = ?, reason = ? WHERE id = ? AND version = ? AND status = 'pending'",
                 (status, reason, file_id, version),
@@ -833,7 +838,7 @@ class LocalStore:
 
     @contextmanager
     def _session(
-        self, *, vector_changes: _VectorChanges | None = None
+        self, *, catalog_change: bool = False, vector_changes: _VectorChanges | None = None
     ) -> Iterator[sqlite3.Connection]:
         with closing(sqlite3.connect(self.database_path, timeout=3.0)) as connection:
             connection.row_factory = sqlite3.Row
@@ -841,17 +846,19 @@ class LocalStore:
             connection.execute("PRAGMA temp_store = MEMORY")
             with connection:
                 yield connection
-                if (
-                    vector_changes is not None
-                    and (vector_changes.deleted or vector_changes.updated)
-                    and connection.total_changes
-                ):
+                vectors_changed = vector_changes is not None and (
+                    vector_changes.deleted or vector_changes.updated
+                )
+                if (catalog_change or vectors_changed) and connection.total_changes:
                     with self._change_lock:
                         connection.commit()
-                        self._vector_revision += 1
-                        if vector_changes.deleted:
-                            self._vector_updates.clear()
-                        else:
-                            self._vector_updates.append(
-                                (self._vector_revision, vector_changes.updated)
-                            )
+                        if catalog_change:
+                            self._catalog_revision += 1
+                        if vectors_changed and vector_changes is not None:
+                            self._vector_revision += 1
+                            if vector_changes.deleted:
+                                self._vector_updates.clear()
+                            else:
+                                self._vector_updates.append(
+                                    (self._vector_revision, vector_changes.updated)
+                                )

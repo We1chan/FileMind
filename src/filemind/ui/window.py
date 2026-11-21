@@ -43,7 +43,7 @@ from filemind.continuous import ContinuousIndex
 from filemind.documents import EXTENSIONS
 from filemind.library import FileAccessError, ImportReport, Library
 from filemind.qa import Questions, RemoteSettings
-from filemind.search import Search
+from filemind.search import MAX_QUERY_CHARS, Search
 from filemind.storage import FileRecord, LocalStore, Passage, Source, StorageStatus
 from filemind.ui.pages import (
     PAGE_COUNT_ROLE,
@@ -158,6 +158,15 @@ class MainWindow(QMainWindow):
         self.monitor = ContinuousIndex(self.library, self.search.semantic) if monitor else None
         self.tray: QSystemTrayIcon | None = None
         self.task: Task | None = None
+        self.catalog_task: Task | None = None
+        self._catalog_revision = -1
+        self._catalog_request = 0
+        self._catalog_pending = False
+        self._pending_page: str | None = None
+        self._filter_delay = QTimer(self)
+        self._filter_delay.setSingleShot(True)
+        self._filter_delay.setInterval(150)
+        self._filter_delay.timeout.connect(self._reload_library)
         self._shutdown_task: Task | None = None
         self.closing = False
         self.offset = 0
@@ -240,8 +249,6 @@ class MainWindow(QMainWindow):
             self._updates.setInterval(1600)
             self._updates.timeout.connect(self._background_status)
             self._updates.start()
-        elif self.library_page.files.count() or self.settings_page.tasks.count():
-            self._refresh()
 
     def _configure_caption(self) -> None:
         self._expanded_caption = True
@@ -481,10 +488,8 @@ class MainWindow(QMainWindow):
         if index < 0:
             return
         self._show_page(index)
-        try:
-            self.store.set_preference(LAST_PAGE, PAGES[index].key)
-        except sqlite3.Error:
-            self.statusBar().showMessage("当前页面已打开，未能保存导航偏好。", 5000)
+        self._pending_page = PAGES[index].key
+        self._start_catalog_task()
 
     def _open_data_dir(self) -> None:
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.paths.root))):
@@ -496,7 +501,7 @@ class MainWindow(QMainWindow):
         library.common_button.clicked.connect(self._add_common)
         library.link_button.clicked.connect(self._link_directory)
         library.refresh_button.clicked.connect(self._refresh)
-        library.filter.textChanged.connect(lambda: self._page(0, reset=True))
+        library.filter.textChanged.connect(self._filter_changed)
         library.previous.clicked.connect(lambda: self._page(-PAGE_SIZE))
         library.next.clicked.connect(lambda: self._page(PAGE_SIZE))
         library.preview_button.clicked.connect(self._preview_file)
@@ -650,19 +655,24 @@ class MainWindow(QMainWindow):
             self.hide()
             event.ignore()
             return
+        self.closing = True
+        self._filter_delay.stop()
+        self._catalog_pending = False
+        if self.monitor is not None:
+            self.monitor.request_stop()
         if self.task is not None:
-            self.closing = True
-            if self.monitor is not None:
-                self.monitor.request_stop()
             self.task.requestInterruption()
             self.statusBar().showMessage("当前操作结束后关闭窗口。")
+            event.ignore()
+            return
+        self._start_catalog_task()
+        if self.catalog_task is not None:
             event.ignore()
             return
         if self.tray is not None:
             self.tray.hide()
         if self.monitor is not None:
             if self._shutdown_task is None:
-                self.monitor.request_stop()
                 self.statusBar().showMessage("正在停止后台索引…")
                 monitor = self.monitor
                 self._shutdown_task = Task(self, lambda _: monitor.stop(), lambda _: None)
@@ -683,6 +693,16 @@ class MainWindow(QMainWindow):
         self.close()
 
     def shutdown(self) -> None:
+        self.closing = True
+        self._filter_delay.stop()
+        if self.catalog_task is not None:
+            self.catalog_task.wait()
+        if self._pending_page is not None:
+            try:
+                self.store.set_preference(LAST_PAGE, self._pending_page)
+            except sqlite3.Error:
+                logging.getLogger(__name__).exception("Could not save FileMind navigation")
+            self._pending_page = None
         if self.task is not None:
             self.task.requestInterruption()
             self.task.wait()
@@ -692,25 +712,94 @@ class MainWindow(QMainWindow):
             self.monitor.stop()
 
     def _reload_library(self) -> None:
-        page = self.library_page
-        query = page.filter.text().strip()
-        records = self.store.files(limit=PAGE_SIZE + 1, offset=self.offset, name=query)
-        if not records and self.offset:
-            self.offset = 0
-            records = self.store.files(limit=PAGE_SIZE + 1, name=query)
-        page.show_files(records, self.store.counts(), self.offset)
-        sources = self.store.sources()
-        self.settings_page.show_tasks(self.store.files(limit=100, status="tasks"), sources)
-        self.search_page.show_sources(sources)
+        if not self.closing and not self._filter_delay.isActive():
+            self._catalog_request += 1
+            self._catalog_pending = True
+            self._start_catalog_task()
 
-    def _page(self, shift: int, *, reset: bool = False) -> None:
-        self.offset = 0 if reset else max(0, self.offset + shift)
+    def _start_catalog_task(self) -> None:
+        if self.catalog_task is not None:
+            return
+        load = self._catalog_pending and not self.closing and not self._filter_delay.isActive()
+        preference = self._pending_page
+        if not load and preference is None:
+            return
+        self._pending_page = None
+        if load:
+            self._catalog_pending = False
+        request = self._catalog_request
+        offset = self.offset
+        query = self.library_page.filter.text().strip()
+        store = self.store
+
+        def read(_stop: Callable[[], bool]) -> Any:
+            if preference is not None:
+                try:
+                    store.set_preference(LAST_PAGE, preference)
+                except sqlite3.Error:
+                    logging.getLogger(__name__).exception("Could not save FileMind navigation")
+            if not load:
+                return None
+            revision = store.catalog_revision
+            start = offset
+            records = store.files(limit=PAGE_SIZE + 1, offset=start, name=query)
+            if not records and start:
+                start = 0
+                records = store.files(limit=PAGE_SIZE + 1, name=query)
+            return (
+                revision,
+                start,
+                records,
+                store.counts(),
+                store.sources(),
+                store.files(limit=100, status="tasks"),
+            )
+
+        def show(snapshot: Any) -> None:
+            if snapshot is None or request != self._catalog_request:
+                return
+            initial = self._catalog_revision == -1
+            self._catalog_revision, self.offset, records, counts, sources, tasks = snapshot
+            self.library_page.show_files(records, counts, self.offset)
+            self.settings_page.show_tasks(tasks, sources)
+            self.search_page.show_sources(sources)
+            if initial and self.monitor is None and self.task is None and (counts[0] or sources):
+                self._refresh()
+
+        self.catalog_task = Task(self, read, show)
+        self.catalog_task.finished.connect(self._catalog_finished)
+        self.catalog_task.start()
+
+    def _catalog_finished(self) -> None:
+        task = self.catalog_task
+        if task is None:
+            return
+        task.wait()
+        self.catalog_task = None
+        task.deleteLater()
+        if self.closing:
+            self.close()
+            return
+        if task.error:
+            self.statusBar().showMessage(task.error, 5000)
+        else:
+            task.completed(task.result)
+        self._start_catalog_task()
+
+    def _filter_changed(self) -> None:
+        self.offset = 0
+        self._catalog_request += 1
+        self._filter_delay.start()
+
+    def _page(self, shift: int) -> None:
+        self.offset = max(0, self.offset + shift)
         self._reload_library()
 
     def _background_status(self) -> None:
         if not self.isVisible() or self.task is not None or self.monitor is None:
             return
-        self._reload_library()
+        if self.catalog_task is None and self._catalog_revision != self.store.catalog_revision:
+            self._reload_library()
         self.settings_page.model_status.setText(self.search.semantic.status)
         if self.monitor.error:
             self.statusBar().showMessage(self.monitor.error, 1500)
@@ -751,9 +840,9 @@ class MainWindow(QMainWindow):
     def _imported(self, report: ImportReport) -> None:
         self._after_index()
         if report.skipped:
-            notes = "\n".join(report.skipped[:3])
-            self.library_page.summary.setText(
-                f"接入 {report.count} 份，跳过 {len(report.skipped)} 份。\n{notes}"
+            notes = " · ".join(report.skipped[:3])
+            self.statusBar().showMessage(
+                f"接入 {report.count} 份，跳过 {len(report.skipped)} 份。 {notes}", 8000
             )
 
     def _link_directory(self) -> None:
@@ -994,7 +1083,7 @@ class MainWindow(QMainWindow):
                 len(parts) == 3
                 and parts[1].isdigit()
                 and self.pdf.open_page(
-                    pdf_data, int(parts[1]), self.search_page.query.text().strip()
+                    pdf_data, int(parts[1]), self.search_page.query.text().strip()[:MAX_QUERY_CHARS]
                 )
             ):
                 self.detail_title.hide()
