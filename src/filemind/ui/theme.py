@@ -14,6 +14,12 @@ from PySide6.QtWidgets import (
 WINDOW_STYLE = """
 QWidget#Shell { background: #f7f5f1; color: #1c3026; }
 QFrame#Sidebar { background: #153728; }
+QToolButton#CaptionButton { background: transparent; border: none; }
+QToolButton#CaptionButton:focus { background: #e0e8dc; }
+QToolButton#CaptionButton[captionHover="true"] { background: #e4e9e0; }
+QToolButton#CaptionClose { background: transparent; border: none; }
+QToolButton#CaptionClose:focus { background: #ebddd9; }
+QToolButton#CaptionClose[captionHover="true"] { background: #edc1b9; }
 QLabel#Brand { color: #fbfbf2; font-family: Georgia; font-size: 26px; font-weight: 600; }
 QListWidget#Navigation {
     background: #153728;
@@ -199,7 +205,14 @@ def line_icon(name: str, color: str = "#151b17") -> QIcon:
     if name == "search":
         painter.drawEllipse(QRectF(2, 2, 15.5, 15.5))
         stroke((15, 15), (21.5, 21.5))
-    elif name == "close":
+    elif name == "caption_minimize":
+        stroke((5, 12), (19, 12))
+    elif name == "caption_maximize":
+        painter.drawRoundedRect(QRectF(5, 5, 14, 14), 0.7, 0.7)
+    elif name == "caption_restore":
+        stroke((8, 5), (19, 5), (19, 16), (16, 16))
+        painter.drawRoundedRect(QRectF(5, 8, 11, 11), 0.7, 0.7)
+    elif name in ("close", "caption_close"):
         stroke((6, 6), (18, 18))
         stroke((18, 6), (6, 18))
     elif name == "folder":

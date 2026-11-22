@@ -173,7 +173,7 @@ def test_tray_activation_restores_native_window_controls(tmp_path: Path) -> None
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 import win32api
 import win32con
@@ -197,24 +197,41 @@ try:
     style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
     assert style & win32con.WS_CAPTION == win32con.WS_CAPTION
 
-    left, top, right, _ = win32gui.GetWindowRect(hwnd)
-    _, client_top = win32gui.ClientToScreen(hwnd, (0, 0))
-    caption_y = (top + client_top) // 2
-    position = win32api.MAKELONG((left + right) // 2, caption_y)
-    assert win32gui.SendMessage(hwnd, win32con.WM_NCHITTEST, 0, position) == win32con.HTCAPTION
-    hits = {
-        win32gui.SendMessage(hwnd, win32con.WM_NCHITTEST, 0, win32api.MAKELONG(x, caption_y))
-        for x in range(right - (right - left) // 2, right, 3)
-    }
-    assert {win32con.HTMINBUTTON, win32con.HTMAXBUTTON, win32con.HTCLOSE} <= hits
+    integrated = app.styleHints().accessibility().contrastPreference() != Qt.ContrastPreference.HighContrast
+    assert window._caption_buttons.isVisible() == integrated
 
+    def assert_caption_targets():
+        left, top, right, _ = win32gui.GetWindowRect(hwnd)
+        _, client_y = win32gui.ClientToScreen(hwnd, (0, 0))
+        scale = window.devicePixelRatioF()
+        caption_y = client_y + round(16 * scale) if integrated else (top + client_y) // 2
+        position = win32api.MAKELONG((left + right) // 2, caption_y)
+        assert win32gui.SendMessage(hwnd, win32con.WM_NCHITTEST, 0, position) == win32con.HTCAPTION
+        if integrated:
+            expected = (win32con.HTMINBUTTON, win32con.HTMAXBUTTON, win32con.HTCLOSE)
+            for control, hit in zip(window._caption_controls, expected, strict=True):
+                assert win32gui.SendMessage(hwnd, win32con.WM_NCHITTEST, 0, button_pos(control)) == hit
+
+    def button_pos(control):
+        x, y = win32gui.ClientToScreen(hwnd, (0, 0))
+        scale = window.devicePixelRatioF()
+        point = control.mapTo(window, control.rect().center())
+        return win32api.MAKELONG(x + round(point.x() * scale), y + round(point.y() * scale))
+
+    assert_caption_targets()
     for _ in range(5):
-        win32gui.SendMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_MAXIMIZE, 0)
-        app.processEvents()
-        assert window.isMaximized()
-        win32gui.SendMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_RESTORE, 0)
-        app.processEvents()
-        assert not window.isMaximized()
+        for target_state in (True, False):
+            if integrated:
+                hit = win32con.HTMAXBUTTON
+                position = button_pos(window._maximize_button)
+                win32gui.SendMessage(hwnd, win32con.WM_NCLBUTTONDOWN, hit, position)
+                win32gui.SendMessage(hwnd, win32con.WM_NCLBUTTONUP, hit, position)
+            else:
+                command = win32con.SC_MAXIMIZE if target_state else win32con.SC_RESTORE
+                win32gui.SendMessage(hwnd, win32con.WM_SYSCOMMAND, command, 0)
+            app.processEvents()
+            assert window.isMaximized() == target_state
+            assert_caption_targets()
 finally:
     window.close()
     window.deleteLater()

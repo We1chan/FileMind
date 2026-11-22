@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl
+from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import (
     QCloseEvent,
     QDesktopServices,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QSystemTrayIcon,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -61,9 +63,11 @@ from filemind.ui.pages import (
 from filemind.ui.pdf_reader import PdfReader
 from filemind.ui.theme import WINDOW_STYLE, NavigationDelegate, application_icon, line_icon
 from filemind.windows import (
+    CAPTION_BUTTON_WIDTH,
+    CAPTION_HEIGHT,
+    IntegratedCaption,
     common_locations,
     set_startup,
-    set_title_bar_colors,
     starts_with_windows,
 )
 
@@ -171,6 +175,8 @@ class MainWindow(QMainWindow):
         self.closing = False
         self.offset = 0
         self._search_split = [414, 586]
+        self._frame = None
+        self._caption_buttons = None
         self.setWindowTitle("FileMind")
         self.setWindowIcon(application_icon())
         self.setMinimumSize(920, 580)
@@ -184,6 +190,7 @@ class MainWindow(QMainWindow):
             QApplication.styleHints() if QApplication.platformName() == "windows" else None
         )
         if self._style_hints is not None:
+            self._frame = IntegratedCaption(self.devicePixelRatioF, self._set_caption_hover)
             self._style_hints.accessibility().contrastPreferenceChanged.connect(
                 self._update_title_bar
             )
@@ -252,11 +259,74 @@ class MainWindow(QMainWindow):
             self._update_title_bar(self._style_hints.accessibility().contrastPreference())
 
     def _update_title_bar(self, contrast: Qt.ContrastPreference) -> None:
-        if self.isVisible() and (handle := self.windowHandle()) is not None:
-            colors = (
-                None if contrast == Qt.ContrastPreference.HighContrast else ("#f7f5f1", "#153728")
-            )
-            set_title_bar_colors(int(handle.winId()), colors)
+        if self._frame is None or self._caption_buttons is None:
+            return
+        integrated = contrast != Qt.ContrastPreference.HighContrast
+        self._frame.set_enabled(int(self.winId()), integrated)
+        self._caption_buttons.setVisible(integrated)
+
+    def nativeEvent(self, event_type, message):
+        if self._frame is not None and event_type == b"windows_generic_MSG":
+            result = self._frame.handle_message(int(message))
+            if result is not None:
+                return True, result
+        return super().nativeEvent(event_type, message)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and self._caption_buttons is not None:
+            self._sync_maximize_button()
+
+    def _set_caption_hover(self, index: int | None) -> None:
+        if self._caption_buttons is None:
+            return
+        for position, control in enumerate(self._caption_controls):
+            hovered = position == index
+            if bool(control.property("captionHover")) != hovered:
+                control.setProperty("captionHover", hovered)
+                control.style().unpolish(control)
+                control.style().polish(control)
+                control.update()
+
+    def _toggle_maximized(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def _sync_maximize_button(self) -> None:
+        maximized = self.isMaximized()
+        self._maximize_button.setIcon(
+            line_icon("caption_restore" if maximized else "caption_maximize")
+        )
+        name = "向下还原" if maximized else "最大化"
+        self._maximize_button.setAccessibleName(name)
+        self._maximize_button.setToolTip(name)
+
+    def _make_caption_buttons(self) -> QWidget:
+        controls = QWidget()
+        row = QHBoxLayout(controls)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        self._caption_controls = []
+        for icon, name, action in (
+            ("caption_minimize", "最小化", self.showMinimized),
+            ("caption_maximize", "最大化", self._toggle_maximized),
+            ("caption_close", "关闭", self.close),
+        ):
+            control = QToolButton()
+            control.setObjectName("CaptionClose" if icon == "caption_close" else "CaptionButton")
+            control.setAccessibleName(name)
+            control.setToolTip(name)
+            control.setIcon(line_icon(icon))
+            control.setIconSize(QSize(14, 14))
+            control.setFixedSize(CAPTION_BUTTON_WIDTH, CAPTION_HEIGHT)
+            control.clicked.connect(action)
+            row.addWidget(control)
+            self._caption_controls.append(control)
+            if icon == "caption_maximize":
+                self._maximize_button = control
+        return controls
 
     def _setup_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -358,7 +428,19 @@ class MainWindow(QMainWindow):
         splitter.setSizes([590, 295])
         content.addWidget(splitter)
 
-        layout.addWidget(work_area, 1)
+        if self._frame is not None:
+            surface = QWidget()
+            overlay = QGridLayout(surface)
+            overlay.setContentsMargins(0, 0, 0, 0)
+            overlay.addWidget(work_area, 0, 0)
+            self._caption_buttons = self._make_caption_buttons()
+            self._caption_buttons.hide()
+            overlay.addWidget(
+                self._caption_buttons, 0, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight
+            )
+            layout.addWidget(surface, 1)
+        else:
+            layout.addWidget(work_area, 1)
         return shell
 
     def _make_sidebar(self) -> QFrame:
