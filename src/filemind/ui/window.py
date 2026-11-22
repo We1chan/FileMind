@@ -33,7 +33,6 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QSplitter,
@@ -66,6 +65,7 @@ from filemind.ui.pages import (
 )
 from filemind.ui.pdf_reader import PdfReader
 from filemind.ui.theme import TITLE_BAR_COLORS, WINDOW_STYLE, application_icon
+from filemind.ui.tray import TrayMenu, tray_icon
 from filemind.windows import (
     common_locations,
     set_startup,
@@ -257,28 +257,45 @@ class MainWindow(QMainWindow):
             self._update_title_bar(self._style_hints.accessibility().contrastPreference())
 
     def _update_title_bar(self, contrast: Qt.ContrastPreference) -> None:
+        high_contrast = contrast == Qt.ContrastPreference.HighContrast
         if self.isVisible() and (handle := self.windowHandle()) is not None:
-            colors = None if contrast == Qt.ContrastPreference.HighContrast else TITLE_BAR_COLORS
+            colors = None if high_contrast else TITLE_BAR_COLORS
             set_title_bar_colors(int(handle.winId()), colors)
+        if self.tray is not None and isinstance(menu := self.tray.contextMenu(), TrayMenu):
+            menu.set_high_contrast(high_contrast)
 
     def _setup_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
-        self.tray = QSystemTrayIcon(self.windowIcon(), self)
-        self.tray.setToolTip("FileMind · 本地资料库")
-        menu = QMenu(self)
-        menu.addAction("打开 FileMind", self.reveal)
-        pause = menu.addAction("暂停后台索引")
-        pause.setCheckable(True)
-        pause.setChecked(self.settings_page.pause.isChecked())
-        pause.toggled.connect(self.settings_page.pause.setChecked)
-        self.settings_page.pause.toggled.connect(pause.setChecked)
-        menu.addAction("立即刷新索引", self._refresh)
-        menu.addSeparator()
-        menu.addAction("退出 FileMind", self.quit)
+        icon = tray_icon()
+        self.tray = QSystemTrayIcon(icon, self)
+        menu = TrayMenu(self, icon)
+        menu.open_window.triggered.connect(self.reveal)
+        menu.toggle_pause.triggered.connect(self.settings_page.pause.toggle)
+        menu.refresh_index.triggered.connect(self._refresh)
+        menu.exit_app.triggered.connect(self.quit)
+        menu.aboutToShow.connect(self._update_tray)
+        self.settings_page.pause.toggled.connect(self._update_tray)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._tray_activated)
+        if self._style_hints is not None:
+            self._update_title_bar(self._style_hints.accessibility().contrastPreference())
+        self._update_tray()
         self.tray.show()
+
+    def _update_tray(self) -> None:
+        if self.monitor is None or self.tray is None:
+            return
+        menu = self.tray.contextMenu()
+        if isinstance(menu, TrayMenu):
+            text = menu.update_status(
+                paused=self.monitor.paused,
+                error=bool(self.monitor.error),
+                busy=self.task is not None,
+            )
+            tooltip = f"FileMind · {text}"
+            if self.tray.toolTip() != tooltip:
+                self.tray.setToolTip(tooltip)
 
     def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (
@@ -752,6 +769,7 @@ class MainWindow(QMainWindow):
         self._reload_library()
 
     def _background_status(self) -> None:
+        self._update_tray()
         if not self.isVisible() or self.task is not None or self.monitor is None:
             return
         if self.catalog_task is None and self._catalog_revision != self.store.catalog_revision:

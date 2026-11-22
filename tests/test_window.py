@@ -5,13 +5,21 @@ from pathlib import Path
 from threading import Event
 
 import pytest
-from PySide6.QtCore import QEvent, QEventLoop, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QEventLoop, QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox, QPushButton
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QSystemTrayIcon,
+)
 
 from filemind.config import AppPaths
 from filemind.storage import LocalStore
+from filemind.ui.tray import TrayMenu
 from filemind.ui.window import MainWindow
 
 
@@ -320,6 +328,58 @@ finally:
         timeout=20,
     )
     assert run.returncode == 0, run.stdout + run.stderr
+
+
+def test_tray_menu_tracks_index_state_while_main_window_is_hidden(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    monkeypatch.setattr(QSystemTrayIcon, "show", lambda _: None)
+    paths = AppPaths.resolve(tmp_path / "app")
+    paths.prepare()
+    store = LocalStore(paths.database)
+    window = MainWindow(paths, store, store.initialize(), monitor=True)
+    try:
+        assert window.tray is not None and window.monitor is not None
+        menu = window.tray.contextMenu()
+        assert isinstance(menu, TrayMenu)
+        assert not window.isVisible()
+        assert "已启用" in window.tray.toolTip()
+
+        menu.popup(QPoint(100, 100))
+        menu.setActiveAction(menu.open_window)
+        QTest.keyClick(menu, Qt.Key.Key_Down)
+        assert menu.activeAction() == menu.toggle_pause
+        QTest.keyClick(menu, Qt.Key.Key_Return)
+        assert window.monitor.paused and window.settings_page.pause.isChecked()
+        assert menu.toggle_pause.text() == "恢复后台索引"
+        assert "已暂停" in window.tray.toolTip()
+        assert menu.refresh_index.isEnabled()
+
+        one_time_refreshes = []
+        monkeypatch.setattr(window.library, "refresh", lambda _: one_time_refreshes.append(True))
+        menu.refresh_index.trigger()
+        wait_for_task(window)
+        assert one_time_refreshes == [True] and window.monitor.paused
+
+        window.settings_page.pause.setChecked(False)
+        assert not window.monitor.paused
+        assert menu.toggle_pause.text() == "暂停后台索引"
+        requests = []
+        monkeypatch.setattr(window.monitor, "refresh", lambda: requests.append(True))
+        menu.refresh_index.trigger()
+        assert requests == [True]
+
+        window._update_title_bar(Qt.ContrastPreference.HighContrast)
+        assert not menu.styleSheet()
+        assert menu.open_window.isEnabled()
+        window._update_title_bar(Qt.ContrastPreference.NoPreference)
+        assert menu.styleSheet()
+    finally:
+        window.shutdown()
+        window.tray.hide()
+        window.deleteLater()
+        app.sendPostedEvents(window, QEvent.Type.DeferredDelete)
 
 
 def test_desktop_import_search_and_open_citation(
