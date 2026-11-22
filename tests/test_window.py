@@ -125,6 +125,51 @@ def close_window(window: MainWindow) -> None:
     QApplication.sendPostedEvents(window, QEvent.Type.DeferredDelete)
 
 
+def test_first_search_after_mode_switch_replaces_multiple_results(
+    app: QApplication, tmp_path: Path
+) -> None:
+    paths = AppPaths.resolve(tmp_path / "app")
+    paths.prepare()
+    store = LocalStore(paths.database)
+    window = MainWindow(paths, store, store.initialize())
+    notes = tmp_path / "ooad-notes.txt"
+    notes.write_text("OOAD: draw the class diagram.", encoding="utf-8")
+    slides = tmp_path / "ooad-review.txt"
+    slides.write_text("OOAD: review the sequence diagram.", encoding="utf-8")
+    try:
+        assert window.library.import_files([notes, slides]).count == 2
+        window.show()
+        click_navigation(window, 1)
+        page = window.search_page
+        page.query.setText("ooad")
+        QTest.mouseClick(page.find_button, Qt.MouseButton.LeftButton)
+        wait_for_task(window)
+        assert page.results.count() == 2
+        assert "语义检索未启用" in page.note.text()
+
+        keyword = next(
+            choice
+            for choice in page.findChildren(QPushButton, "ModeChoice")
+            if choice.text() == "关键词"
+        )
+        QTest.mouseClick(keyword, Qt.MouseButton.LeftButton)
+        QTest.mouseClick(page.find_button, Qt.MouseButton.LeftButton)
+        wait_for_task(window)
+        assert page.results.count() == 2
+        assert page.note.text() == "找到 2 个相关文件"
+        assert "OOAD" in window.preview.toPlainText()
+
+        page.query.setText("unmatched-workshop")
+        QTest.mouseClick(page.find_button, Qt.MouseButton.LeftButton)
+        wait_for_task(window)
+        assert page.results.count() == 0
+        assert page.note.text() == "未找到匹配文件。"
+        assert window.preview.isHidden()
+        assert not window.ask_file.isEnabled()
+    finally:
+        close_window(window)
+
+
 def test_library_filter_discards_a_slow_obsolete_query(
     app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

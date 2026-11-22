@@ -588,6 +588,8 @@ class SearchPage(QWidget):
     def clear_results(self) -> None:
         self.last_search = None
         self.sort.hide()
+        # Removing the current row can select another result and start its preview.
+        self.results.setCurrentRow(-1)
         self.results.clear()
         self.answer.clear()
         self.answer.hide()
