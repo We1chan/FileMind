@@ -91,6 +91,18 @@ QPlainTextEdit#SourcePreview {
 }
 QListWidget#SearchResults { background: #faf9f5; border: none; }
 QListWidget#SearchResults::item { padding: 14px 9px; border-bottom: 1px solid #d6dccf; }
+#OrganizationTabs QTabBar::tab {
+    background: #f3f2eb;
+    color: #475b4d;
+    border-bottom: 2px solid #d6dbd0;
+    padding: 6px 12px;
+}
+#OrganizationTabs QTabBar::tab:selected {
+    background: #eaf0e4;
+    color: #193f30;
+    border-bottom-color: #426b4b;
+    font-weight: 600;
+}
 QLabel#SectionTitle { font-family: "SimSun"; font-size: 21px; }
 """
 

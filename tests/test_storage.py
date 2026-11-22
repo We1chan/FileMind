@@ -138,3 +138,24 @@ def test_version_three_library_gets_hash_index_without_changing_references(
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE name = 'files_by_hash'"
         ).fetchone() == ("files_by_hash",)
+
+
+def test_version_four_library_keeps_file_ids_and_gains_organization(library: Library) -> None:
+    note = library.paths.root.parent / "notes.txt"
+    note.write_text("OrganizationMigrationNeedle", encoding="utf-8")
+    library.import_files([note])
+    passage = library.preview_file(library.store.files()[0].id)
+    with closing(sqlite3.connect(library.paths.database)) as connection, connection:
+        connection.execute("DROP TABLE organization_moves")
+        connection.execute("DROP TABLE organization_plans")
+        connection.execute("DROP TABLE file_tags")
+        connection.execute("PRAGMA user_version = 4")
+
+    reopened = LocalStore(library.paths.database)
+    assert reopened.initialize().schema_version == SCHEMA_VERSION
+    migrated = Library(library.paths, reopened)
+    assert migrated.preview(passage.chunk_id, passage.file.version) == passage
+    migrated.organizer.edit_tags(passage.file.id, "旧资料")
+    plan = migrated.organizer.preview([passage.file.id])
+    assert reopened.tags() == {passage.file.id: ("旧资料",)}
+    assert reopened.move_plan(plan.id) == plan

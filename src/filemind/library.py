@@ -8,7 +8,9 @@ import stat
 from collections.abc import Callable, Generator, Iterable
 from contextlib import closing
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from filemind.config import AppPaths, checkout_data_dir, installed_data_dir
@@ -30,6 +32,9 @@ from filemind.storage import (
     Source,
 )
 from filemind.text_index import keyword_terms, split_section
+
+if TYPE_CHECKING:
+    from filemind.organize import Organizer
 
 DISCOVERY_BATCH = 256
 _SKIPPED_DIRECTORIES = {
@@ -179,6 +184,12 @@ class Library:
         self.excluded_directories = tuple(
             map(Path, json.loads(store.get_preference(_EXCLUSIONS) or "[]"))
         )
+
+    @cached_property
+    def organizer(self) -> "Organizer":
+        from filemind.organize import Organizer
+
+        return Organizer(self)
 
     def excluded(
         self,
@@ -340,11 +351,13 @@ class Library:
 
     def refresh_managed(self, cancelled: Callable[[], bool], *, verify: bool = False) -> None:
         _require_directory(self.paths.workspace)
+        unresolved = self.organizer.recover()
         with closing(DocumentParser(self.paths.temporary)) as parser:
             for file in self.store.source_files(None).values():
                 if cancelled():
                     return
-                self._index(file, parser, missing_allowed=True, verify=verify)
+                if file.id not in unresolved:
+                    self._index(file, parser, missing_allowed=True, verify=verify)
 
     def _discover(
         self,
@@ -522,6 +535,9 @@ class Library:
     def retry(self, file_id: int) -> None:
         file = self.store.file(file_id)
         if file is not None:
+            if file.source_id is None and file_id in self.organizer.recover():
+                raise FileAccessError("此文件在中断的整理计划中，请先核对其路径。")
+            file = self.store.file(file_id) or file
             with closing(DocumentParser(self.paths.temporary)) as parser:
                 self._index(file, parser, force=True, missing_allowed=file.source_id is None)
 

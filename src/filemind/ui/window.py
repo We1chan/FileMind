@@ -48,9 +48,11 @@ from filemind.config import AppPaths
 from filemind.continuous import ContinuousIndex
 from filemind.documents import EXTENSIONS
 from filemind.library import FileAccessError, ImportReport, Library
+from filemind.organize import OrganizationSnapshot
 from filemind.qa import Questions, RemoteSettings
 from filemind.search import MAX_QUERY_CHARS, Search
 from filemind.storage import FileRecord, LocalStore, Passage, Source, StorageStatus
+from filemind.ui.organize_page import OrganizePage
 from filemind.ui.pages import (
     PAGE_SIZE,
     ROLE,
@@ -81,8 +83,6 @@ class Page:
     description: str
     detail_title: str
     detail_hint: str
-    empty_title: str = ""
-    empty_hint: str = ""
 
 
 PAGES = (
@@ -103,11 +103,9 @@ PAGES = (
     Page(
         "organize",
         "智能整理",
-        "审核整理计划并管理受管文件",
+        "添加标签、核对重复文件，或预览受管副本的移动计划",
         "计划详情",
-        "选中计划后查看拟移动的文件及其目标位置。",
-        "整理待实现",
-        "标签、完全重复检测、整理预览和撤销正在开发。",
+        "选择一项查看完整路径、标签或执行结果。",
     ),
     Page(
         "settings",
@@ -167,6 +165,7 @@ class MainWindow(QMainWindow):
         self._catalog_request = 0
         self._catalog_pending = False
         self._pending_page: str | None = None
+        self._organization_pending = False
         self._filter_delay = QTimer(self)
         self._filter_delay.setSingleShot(True)
         self._filter_delay.setInterval(150)
@@ -199,12 +198,13 @@ class MainWindow(QMainWindow):
         self.pages.setAccessibleName("工作区")
         self.library_page = LibraryPage()
         self.search_page = SearchPage()
+        self.organize_page = OrganizePage()
         self.settings_page = SettingsPage(storage_status, paths.root, self.remote)
         self.settings_page.startup.setVisible(startup_allowed)
         self.settings_page.startup.setChecked(startup_allowed and starts_with_windows())
         self.settings_page.pause.setVisible(self.monitor is not None)
         self.settings_page.pause.setChecked(self.monitor is not None and self.monitor.paused)
-        bodies = (self.library_page, self.search_page, None, self.settings_page)
+        bodies = (self.library_page, self.search_page, self.organize_page, self.settings_page)
         for page, body in zip(PAGES, bodies, strict=True):
             item = QListWidgetItem(page.title)
             symbols = {
@@ -241,6 +241,8 @@ class MainWindow(QMainWindow):
         self.navigation.currentRowChanged.connect(self._navigate)
         self._connect_actions()
         self._reload_library()
+        if PAGES[selected].key == "organize":
+            self._reload_organization()
         if self.monitor is not None:
             self.monitor.start()
             self._setup_tray()
@@ -339,6 +341,7 @@ class MainWindow(QMainWindow):
         self.pdf.render_failed.connect(self._pdf_failed)
         detail_layout.addWidget(self.pdf, 1)
         detail_layout.addWidget(self.preview, 1)
+        detail_layout.addWidget(self.organize_page.details, 1)
         self.ask_file = button("基于此文件提问", "AskFile")
         self.ask_file.clicked.connect(self._ask_file)
         detail_layout.addWidget(self.ask_file, alignment=Qt.AlignmentFlag.AlignHCenter)
@@ -371,7 +374,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(label(f"版本 {__version__}", "Version"))
         return sidebar
 
-    def _make_page(self, page: Page, body: QWidget | None) -> QWidget:
+    def _make_page(self, page: Page, body: QWidget) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 1, 0, 0)
@@ -380,22 +383,8 @@ class MainWindow(QMainWindow):
         if page.key != "search":
             layout.addWidget(label(page.description, "Hint", wrap=True))
         layout.addSpacing(10)
-        layout.addWidget(body if body is not None else self._make_empty_state(page), 1)
+        layout.addWidget(body, 1)
         return widget
-
-    def _make_empty_state(self, page: Page) -> QFrame:
-        card = QFrame()
-        card.setObjectName("Card")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(22, 22, 22, 22)
-        layout.setSpacing(10)
-        layout.addStretch()
-        for text, role in ((page.empty_title, "SectionTitle"), (page.empty_hint, "Hint")):
-            text_label = label(text, role, wrap=True)
-            text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(text_label)
-        layout.addStretch()
-        return card
 
     def _show_page(self, index: int) -> None:
         page = PAGES[index]
@@ -412,6 +401,8 @@ class MainWindow(QMainWindow):
             self._file_detail()
         elif searching and self.search_page.results.currentItem() is not None:
             self._preview_citation(self.search_page.results.currentItem())
+        elif page.key == "organize":
+            self._organization_detail()
         elif page.key == "settings":
             self._task_detail()
             self.settings_page.model_status.setText(self.search.semantic.status)
@@ -425,6 +416,7 @@ class MainWindow(QMainWindow):
         self.detail_title.show()
         self.preview.clear()
         self.preview.hide()
+        self.organize_page.details.hide()
 
     def _navigate(self, index: int) -> None:
         if index < 0:
@@ -432,6 +424,8 @@ class MainWindow(QMainWindow):
         self._show_page(index)
         self._pending_page = PAGES[index].key
         self._start_catalog_task()
+        if PAGES[index].key == "organize":
+            self._reload_organization()
 
     def _open_data_dir(self) -> None:
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.paths.root))):
@@ -465,6 +459,16 @@ class MainWindow(QMainWindow):
             lambda current, _: self._preview_citation(current) if current else None
         )
         search.results.itemActivated.connect(self._preview_citation)
+
+        organize = self.organize_page
+        organize.refresh.clicked.connect(self._reload_organization)
+        organize.detail_changed.connect(self._organization_detail)
+        organize.save_tags.clicked.connect(self._save_organization_tags)
+        organize.tag_input.returnPressed.connect(self._save_organization_tags)
+        organize.preview.clicked.connect(self._preview_organization)
+        organize.history.currentIndexChanged.connect(self._show_organization_plan)
+        organize.apply.clicked.connect(lambda: self._execute_organization(undo=False))
+        organize.undo.clicked.connect(lambda: self._execute_organization(undo=True))
 
         settings = self.settings_page
         settings.open_button.clicked.connect(self._open_data_dir)
@@ -571,7 +575,13 @@ class MainWindow(QMainWindow):
         self.task.start()
 
     def _enable_actions(self, enabled: bool) -> None:
-        for page in (self.library_page, self.search_page, self.settings_page):
+        for page in (
+            self.library_page,
+            self.search_page,
+            self.settings_page,
+            self.organize_page,
+            self.organize_page.details,
+        ):
             page.setEnabled(enabled)
 
     def _finished(self) -> None:
@@ -591,6 +601,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(task.error, 8000)
         else:
             task.completed(task.result)
+        if self._organization_pending:
+            self._organization_pending = False
+            if PAGES[self.pages.currentIndex()].key == "organize":
+                self._reload_organization()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.tray is not None and not self.closing:
@@ -892,6 +906,111 @@ class MainWindow(QMainWindow):
             str(self.library.path_for(file)),
         )
         self.detail_hint.setText("\n\n".join(filter(None, parts)))
+
+    def _organization_detail(self) -> None:
+        if PAGES[self.pages.currentIndex()].key == "organize":
+            page = self.organize_page
+            self.detail_title.setText(page.show_detail(self.paths.workspace))
+            self.detail_hint.setVisible(page.details.isHidden())
+
+    def _reload_organization(self) -> None:
+        if self.task is not None:
+            self._organization_pending = True
+            return
+        organizer = self.library.organizer
+        plan_id = self.organize_page.history_id()
+
+        def load(stop: Callable[[], bool]) -> OrganizationSnapshot:
+            organizer.recover()
+            return organizer.snapshot(plan_id, stop)
+
+        self._start("正在刷新整理页面…", load, self.organize_page.show_snapshot)
+
+    def _save_organization_tags(self) -> None:
+        page = self.organize_page
+        if (file := page.selected_file()) is None:
+            return
+        tags, plan_id = page.tag_input.text(), page.history_id()
+        organizer = self.library.organizer
+
+        def save(stop: Callable[[], bool]) -> OrganizationSnapshot:
+            organizer.edit_tags(file.id, tags)
+            return organizer.snapshot(plan_id, stop)
+
+        def show(snapshot: OrganizationSnapshot) -> None:
+            page.show_snapshot(snapshot)
+            self.statusBar().showMessage("标签已保存。", 4000)
+
+        self._start("正在保存标签…", save, show, writes=True)
+
+    def _preview_organization(self) -> None:
+        page = self.organize_page
+        selected = page.checked_files()
+        if not selected:
+            return
+        organizer = self.library.organizer
+
+        def preview(stop: Callable[[], bool]) -> OrganizationSnapshot:
+            plan = organizer.preview(selected)
+            return organizer.snapshot(plan.id, stop)
+
+        def show(snapshot: OrganizationSnapshot) -> None:
+            page.show_snapshot(snapshot)
+            page.tabs.setCurrentIndex(2)
+            skipped = len(selected) - len(snapshot.plan.items)
+            message = "计划已生成。请核对目标位置，再确认执行。"
+            if skipped:
+                message += f" {skipped} 项状态已变更或不可整理，未加入计划。"
+            self.statusBar().showMessage(message, 8000)
+
+        self._start("正在生成整理计划…", preview, show, writes=True)
+
+    def _show_organization_plan(self) -> None:
+        page = self.organize_page
+        page.show_plan(None)
+        if plan_id := page.history_id():
+            self._start(
+                "正在读取整理计划…", lambda _: self.store.move_plan(plan_id), page.show_plan
+            )
+
+    def _execute_organization(self, *, undo: bool) -> None:
+        page = self.organize_page
+        plan = page.plan
+        if plan is None or self.task is not None:
+            return
+        selected = {"moved", "undo_failed"} if undo else {"pending"}
+        count = sum(item.state in selected for item in plan.items)
+        if not count:
+            return
+        action = "撤销移动" if undo else "确认执行"
+        description = (
+            f"按逆序将 {count} 个受管副本移回原位置？"
+            if undo
+            else f"按预览将 {count} 个受管副本移到目标位置？"
+        )
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle(action)
+        dialog.setText(description)
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        dialog.button(QMessageBox.StandardButton.Yes).setText(action)
+        dialog.button(QMessageBox.StandardButton.Cancel).setText("取消")
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if dialog.exec() != QMessageBox.StandardButton.Yes:
+            return
+        organizer = self.library.organizer
+
+        def execute(stop: Callable[[], bool]) -> OrganizationSnapshot:
+            organizer.run(plan.id, plan.digest, stop, undo=undo)
+            return organizer.snapshot(plan.id, stop)
+
+        def show(snapshot: OrganizationSnapshot) -> None:
+            page.show_snapshot(snapshot)
+            self._after_index()
+
+        self._start(f"正在{action}…", execute, show, writes=True)
 
     def _search(self, ask: bool) -> None:
         page = self.search_page

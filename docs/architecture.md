@@ -13,6 +13,9 @@ flowchart LR
     Task --> Library["文件库"]
     Task --> Search["检索"]
     Task --> QA["引用问答"]
+    Task --> Organizer["受管副本整理"]
+    Organizer --> Store
+    Organizer --> Files
     QA --> Search
     QA --> Remote["已授权的问答服务"]
     Library --> Parser["解析与分块"]
@@ -28,6 +31,7 @@ flowchart LR
 | `filemind.ui` | 桌面交互、索引任务、检索结果、引用及纯文本和 PDF 预览 |
 | `filemind.config` | 默认应用数据路径与显式 `--data-dir` |
 | `filemind.library` | 保存受管副本、检查来源权限、扫描、重试及原文校验 |
+| `filemind.organize` 和 `filemind.managed_move` | 标签建议、重复分组、整理计划、逐项移动和撤销，以及中断恢复 |
 | `filemind.documents` 和 `filemind.text_index` | 格式解析、位置与原文保留、WordPiece 分块及 jieba 分词 |
 | `filemind.continuous` | 监听目录、合并变更、分批补建内容和向量 |
 | `filemind.file_metadata` 和 `filemind.windows` | 压缩包目录、EXE 版本资源、Windows 目录解析和登录启动 |
@@ -35,7 +39,7 @@ flowchart LR
 | `filemind.search` 和 `filemind.embeddings` | 文件级 BM25、余弦相似度和 RRF 排序 |
 | `filemind.qa` | 限定证据、调用问答服务并核验引用 |
 
-SQLite 结构版本 4 增加文件 SHA-256 索引和 Office 解析版本。每个数据目录由一个桌面进程管理。SQLite 使用 WAL 支持扫描时读索引。交互文件写入与后台目录索引共享调度。向量按不可复用的文本块 ID 写入，文件内容更新后旧块的向量写入自动跳过。源码环境的资料库、权重和临时文件位于仓库的 `data/`。
+SQLite 结构版本 5 添加文件标签、整理计划和逐项记录表，保留已有索引和引用。每个数据目录由一个桌面进程管理。SQLite 使用 WAL 支持扫描时读索引。交互文件写入与后台目录索引共享调度。向量按不可复用的文本块 ID 写入，文件内容更新后旧块的向量写入自动跳过。源码环境的资料库、权重和临时文件位于仓库的 `data/`。
 
 ## 文件与索引
 
@@ -46,6 +50,12 @@ SQLite 结构版本 4 增加文件 SHA-256 索引和 Office 解析版本。每�
 - 正文和导入副本上限 32 MiB。PDF 和现代 Office 在批次内复用独立解析子进程，每个进程最多处理 32 份快照。每份文档的解析时限为 25 秒，批处理输出上限为 64 MiB，超时或通信失败后回收进程。旧版 Word 和 PowerPoint 继续单文件启动 Windows 文档筛选器。Office 部件总解压上限 128 MiB，单个 XML 上限 8 MiB。PDF 和 PPTX 最多 1000 页或张，提取文本最多 200 万字符。跳过应用数据目录、链接、重解析点和常见敏感配置名称。
 - ZIP、7Z、RAR 和 TAR 等只读取目录条目，上限为 1000 项或 128 KiB。EXE 使用 Windows 版本资源。它们可以做关键词与名称检索，问答的证据范围限文档正文。
 - 原文按 PDF 物理页、PPTX 幻灯片、Word 段落与表格、Excel 行和文本行保存。Word 相邻短段、短表格单元及相邻 Excel 行可合并，引用保留相应范围。使用 BGE 的 WordPiece 词表切为最多 384 token 的块并保留原文偏移。改用新版 Office 分块的文件在生成向量时加入文件名与已有标题。FTS5 单独保存分词后的术语，`FIRST/FOLLOW`、`B+`、`C++` 和扩展名以完整词项匹配。
+
+## 智能整理
+
+- 整理页在后台读取受管副本和标签，并对已索引的 SHA-256 候选核对文件状态，按不同路径展示副本。标签建议和归档目录来自本地文件类型规则。
+- 预览保存计划 ID 和不可变项目摘要。执行逐项核对文件 ID、相对路径、版本、身份、时间及完整 SHA-256。Windows 移动使用已打开的源文件和目标目录句柄，拒绝重解析点并由系统禁止替换已有目标。同一事务写入移动结果及文件的新路径和指纹，文件 ID、内容版本及原文索引沿用原记录。 [Windows 文件重命名接口](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information)
+- 移动前先提交单项意图。重启后在补扫受管工作区前对照文件身份和内容校验两端位置，补齐已发生的移动记录。无法判定位置时保留待核对项，索引补扫跳过该文件。撤销复用同一机制，按计划逆序执行，保留被占用的目标。
 
 ## 检索与问答
 

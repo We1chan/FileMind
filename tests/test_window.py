@@ -8,7 +8,7 @@ import pytest
 from PySide6.QtCore import QEvent, QEventLoop, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QPushButton
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox, QPushButton
 
 from filemind.config import AppPaths
 from filemind.storage import LocalStore
@@ -160,6 +160,120 @@ def test_library_filter_discards_a_slow_obsolete_query(
         assert applied == [["new.txt"]]
     finally:
         release.set()
+        close_window(window)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows managed moves")
+def test_desktop_organization_flow(
+    app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "计算机学院_跨学期课程项目阶段验收材料（含代码及实验记录）_最终提交版.txt"
+    source.write_text("FIRST/FOLLOW 用于构造预测分析表。", encoding="utf-8")
+    monkeypatch.setattr(
+        QFileDialog, "getOpenFileNames", staticmethod(lambda *a, **k: ([str(source)], ""))
+    )
+    paths = AppPaths.resolve(tmp_path / "app")
+    paths.prepare()
+    store = LocalStore(paths.database)
+    window = MainWindow(paths, store, store.initialize())
+    window.resize(920, 580)
+    window.show()
+
+    def click(control: QPushButton) -> None:
+        assert control.isVisible() and control.isEnabled()
+        QTest.mouseClick(control, Qt.MouseButton.LeftButton)
+        wait_for_task(window)
+
+    def answer(control: QPushButton, response: QMessageBox.StandardButton) -> None:
+        def confirm() -> None:
+            modal = app.activeModalWidget()
+            modal.button(response).click()
+
+        QTimer.singleShot(0, confirm)
+        click(control)
+
+    try:
+        click_navigation(window, 2)
+        wait_for_task(window)
+        page = window.organize_page
+        assert "导入副本" in page.file_summary.text()
+        assert not page.preview.isEnabled()
+        assert window.width() == 920
+        click_navigation(window, 0)
+        click(window.library_page.import_button)
+        click(window.library_page.import_button)
+        click_navigation(window, 1)
+        window.search_page.query.setText("FIRST/FOLLOW")
+        click(window.search_page.find_button)
+        assert window.search_page.results.count() == 1
+        click(window.search_page.ask_button)
+        assert "原文摘录" in window.search_page.note.text()
+        results = window.search_page.results
+        citation = results.item(0)
+        QTest.mouseClick(
+            results.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=results.visualItemRect(citation).center(),
+        )
+        wait_for_task(window)
+        assert "预测分析表" in window.preview.toPlainText()
+
+        click_navigation(window, 2)
+        wait_for_task(window)
+        assert page.files.count() == 2
+        assert source.name in page.files.item(0).toolTip()
+        selected = page.selected_file()
+        assert selected is not None and source.name in page.detail_text.toPlainText()
+        click(page.suggestion)
+        assert page.tag_input.text() == "文档"
+        page.tag_input.setText("文档，课程项目")
+        click(page.save_tags)
+        assert store.tags()[selected.id] == ("文档", "课程项目")
+        page.filter.setText("没有这个标签")
+        assert "没有符合" in page.file_summary.text()
+        assert page.tag_panel.isHidden()
+        page.filter.clear()
+
+        page.tabs.setCurrentIndex(1)
+        assert page.duplicates.count() == 2
+        page.duplicates.setCurrentRow(0)
+        location_one = page.detail_text.toPlainText()
+        page.duplicates.setCurrentRow(1)
+        location_two = page.detail_text.toPlainText()
+        assert location_one != location_two and "SHA-256" in location_two
+        page.tabs.setCurrentIndex(0)
+        page.files.setCurrentRow(0)
+        QTest.keyClick(page.files, Qt.Key.Key_Space)
+        assert len(page.checked_files()) == 1
+        click(page.preview)
+        assert page.tabs.currentIndex() == 2 and page.plan is not None
+        intent = page.plan.items[0]
+        origin, target = paths.workspace / intent.origin, paths.workspace / intent.destination
+        assert str(origin) in page.detail_text.toPlainText()
+        assert str(target) in page.detail_text.toPlainText()
+        assert origin.is_file() and not target.exists()
+        answer(page.apply, QMessageBox.StandardButton.Cancel)
+        assert origin.is_file() and not target.exists()
+        answer(page.apply, QMessageBox.StandardButton.Yes)
+        assert target.is_file() and not origin.exists()
+        assert "1 项已移动" in page.plan_summary.text()
+    finally:
+        close_window(window)
+
+    reopened_store = LocalStore(paths.database)
+    window = MainWindow(paths, reopened_store, reopened_store.initialize())
+    window.show()
+    try:
+        wait_for_task(window)
+        assert window.navigation.currentItem().text() == "智能整理"
+        page = window.organize_page
+        page.tabs.setCurrentIndex(2)
+        assert "1 项已移动" in page.plan_summary.text()
+        answer(page.undo, QMessageBox.StandardButton.Yes)
+        assert origin.is_file() and not target.exists()
+        assert "1 项已撤销" in page.plan_summary.text()
+        assert reopened_store.tags()[selected.id] == ("文档", "课程项目")
+    finally:
         close_window(window)
 
 

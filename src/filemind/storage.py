@@ -18,7 +18,7 @@ from filemind.documents import (
 )
 from filemind.text_index import TextChunk, catalog_terms
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 OFFICE_PARSER_VERSION = 1
 RECHUNKED_EXTENSIONS = (*WORD_EXTENSIONS, *SHEET_EXTENSIONS, *LEGACY_OFFICE_EXTENSIONS)
 _LIBRARY_SCHEMA = (
@@ -68,6 +68,32 @@ _LIBRARY_SCHEMA = (
     "CREATE INDEX chunks_section ON chunks(section_id)",
 )
 _FILES = "FROM files f LEFT JOIN sources src ON src.id = f.source_id"
+_ORGANIZATION_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS file_tags (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        tags TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS organization_plans (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        digest TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS organization_moves (
+        plan_id TEXT NOT NULL REFERENCES organization_plans(id),
+        position INTEGER NOT NULL,
+        file_id INTEGER NOT NULL REFERENCES files(id),
+        origin TEXT NOT NULL,
+        destination TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        sha256 TEXT NOT NULL,
+        identity TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending',
+        reason TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (plan_id, position)
+    )""",
+    """CREATE INDEX IF NOT EXISTS organization_inflight ON organization_moves(file_id)
+    WHERE state IN ('moving', 'undoing')""",
+)
 _PASSAGES = """
     FROM chunks c JOIN sections s ON s.id = c.section_id
     JOIN files f ON f.id = s.file_id LEFT JOIN sources src ON src.id = f.source_id
@@ -114,6 +140,36 @@ class FileRecord:
     changed_ns: int | None
     identity: str | None = None
     parser_version: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class MoveItem:
+    position: int
+    file_id: int
+    origin: str
+    destination: str
+    version: int
+    sha256: str
+    identity: str
+    state: str = "pending"
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PlanSummary:
+    id: str
+    created_at: str
+    total: int
+    pending: int
+    undoable: int
+    interrupted: int
+
+
+@dataclass(frozen=True, slots=True)
+class MovePlan:
+    id: str
+    digest: str
+    items: tuple[MoveItem, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +250,7 @@ class LocalStore:
         self.database_path = database_path
         self.fts5_available = False
         self._change_lock = Lock()
+        self.organization_lock = Lock()
         self._catalog_revision = 0
         self._vector_revision = 0
         self._vector_updates: deque[tuple[int, tuple[int, ...]]] = deque(maxlen=64)
@@ -253,6 +310,9 @@ class LocalStore:
                 connection.execute(
                     "ALTER TABLE sections ADD COLUMN heading TEXT NOT NULL DEFAULT ''"
                 )
+            if schema_version < 5:
+                for statement in _ORGANIZATION_SCHEMA:
+                    connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             if not any(
                 row[1] == "identity" for row in connection.execute("PRAGMA table_info(files)")
@@ -451,10 +511,10 @@ class LocalStore:
             )
             return [_file(row) for row in rows]
 
-    def file_at(self, source_id: int, key: str) -> FileRecord | None:
+    def file_at(self, source_id: int | None, key: str) -> FileRecord | None:
         with self._session() as connection:
             row = connection.execute(
-                f"SELECT f.*, src.path AS source_path {_FILES} WHERE f.source_id = ? AND f.path_key = ?",
+                f"SELECT f.*, src.path AS source_path {_FILES} WHERE f.source_id IS ? AND f.path_key = ?",
                 (source_id, key),
             ).fetchone()
             return _file(row) if row else None
@@ -465,6 +525,134 @@ class LocalStore:
                 f"SELECT f.*, src.path AS source_path {_FILES} WHERE f.id = ?", (file_id,)
             ).fetchone()
             return _file(row) if row else None
+
+    def duplicate_candidates(self) -> list[FileRecord]:
+        with self._session() as connection:
+            rows = connection.execute(
+                f"""SELECT f.*, src.path AS source_path {_FILES}
+                WHERE f.import_from IS NULL AND f.status != 'missing' AND f.sha256 IN (
+                    SELECT sha256 FROM files
+                    WHERE sha256 IS NOT NULL AND import_from IS NULL AND status != 'missing'
+                    GROUP BY sha256 HAVING count(*) > 1
+                ) ORDER BY f.sha256, f.id"""
+            )
+            return [_file(row) for row in rows]
+
+    def tags(self) -> dict[int, tuple[str, ...]]:
+        with self._session() as connection:
+            return {
+                row[0]: tuple(json.loads(row[1]))
+                for row in connection.execute("SELECT file_id, tags FROM file_tags")
+            }
+
+    def save_tags(self, file_id: int, tags: tuple[str, ...]) -> None:
+        with self._session() as connection:
+            if tags:
+                connection.execute(
+                    "INSERT INTO file_tags VALUES (?, ?) ON CONFLICT(file_id) "
+                    "DO UPDATE SET tags = excluded.tags",
+                    (file_id, json.dumps(tags, ensure_ascii=False)),
+                )
+            else:
+                connection.execute("DELETE FROM file_tags WHERE file_id = ?", (file_id,))
+
+    def save_move_plan(self, plan: MovePlan, created_at: str) -> None:
+        with self._session() as connection:
+            connection.execute(
+                "INSERT INTO organization_plans VALUES (?, ?, ?)",
+                (plan.id, created_at, plan.digest),
+            )
+            connection.executemany(
+                """INSERT INTO organization_moves
+                (plan_id, position, file_id, origin, destination, version, sha256, identity)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    (
+                        plan.id,
+                        item.position,
+                        item.file_id,
+                        item.origin,
+                        item.destination,
+                        item.version,
+                        item.sha256,
+                        item.identity,
+                    )
+                    for item in plan.items
+                ),
+            )
+
+    def move_plans(self) -> list[PlanSummary]:
+        with self._session() as connection:
+            rows = connection.execute(
+                """SELECT p.id, p.created_at, count(*),
+                    count(*) FILTER (WHERE m.state = 'pending'),
+                    count(*) FILTER (WHERE m.state IN ('moved', 'undo_failed')),
+                    count(*) FILTER (WHERE m.state IN ('moving', 'undoing'))
+                FROM organization_plans p JOIN organization_moves m ON p.id = m.plan_id
+                GROUP BY p.id ORDER BY p.rowid DESC"""
+            )
+            return [PlanSummary(*row) for row in rows]
+
+    def move_plan(self, plan_id: str) -> MovePlan | None:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT digest FROM organization_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            items = connection.execute(
+                """SELECT position, file_id, origin, destination, version, sha256, identity,
+                    state, reason FROM organization_moves WHERE plan_id = ? ORDER BY position""",
+                (plan_id,),
+            )
+            return MovePlan(plan_id, row[0], tuple(MoveItem(*item) for item in items))
+
+    def inflight_moves(self) -> list[tuple[str, MoveItem]]:
+        with self._session() as connection:
+            rows = connection.execute(
+                """SELECT plan_id, position, file_id, origin, destination, version, sha256,
+                    identity, state, reason FROM organization_moves
+                    WHERE state IN ('moving', 'undoing')"""
+            )
+            return [(row[0], MoveItem(*tuple(row)[1:])) for row in rows]
+
+    def record_move(
+        self,
+        plan_id: str,
+        item: MoveItem,
+        state: str,
+        *,
+        reason: str = "",
+        new_path: tuple[Path, str] | None = None,
+        fingerprint: tuple[int, int, int, str] | None = None,
+    ) -> None:
+        with self._session(catalog_change=new_path is not None) as connection:
+            updated = connection.execute(
+                """UPDATE organization_moves SET state = ?, reason = ?
+                WHERE plan_id = ? AND position = ? AND state = ?""",
+                (state, reason, plan_id, item.position, item.state),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("Organization item changed during operation")
+            if new_path is not None and fingerprint is not None:
+                relative, key = new_path
+                updated = connection.execute(
+                    """UPDATE files SET relative_path = ?, path_key = ?, size = ?,
+                        modified_ns = ?, changed_ns = ?, identity = ?
+                    WHERE id = ? AND source_id IS NULL AND relative_path = ?
+                        AND version = ? AND sha256 = ?""",
+                    (
+                        str(relative),
+                        key,
+                        *fingerprint,
+                        item.file_id,
+                        item.origin if state == "moved" else item.destination,
+                        item.version,
+                        item.sha256,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError("Managed file changed during organization")
 
     def files_by_id(self, file_ids: set[int]) -> dict[int, FileRecord]:
         ids = list(file_ids)
