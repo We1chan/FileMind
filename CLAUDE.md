@@ -80,5 +80,5 @@ uv build --no-sources
 
 ## 文档与版本
 
-- 版本号以 `pyproject.toml` 的 `project.version` 为准，开发版格式为 `0.1.0.devN`。分支命名用 `feat/<主题>` / `fix/<主题>`。
+- 版本号以 `pyproject.toml` 的 `project.version` 为准，开发版格式为 `0.1.0.devN`。
 - 变更涉及需求、架构或用法时，按 `docs/README.md` 的维护表在同一变更中更新文档。`docs/progress.md` 要写明实际环境、命令、结果和未验证项，`CHANGELOG.md` 记录用户能感知的变化。
