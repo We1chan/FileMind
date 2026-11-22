@@ -6,9 +6,10 @@ import json
 import sqlite3
 import sys
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QLockFile, QTimer
+from PySide6.QtCore import QEvent, QEventLoop, QLockFile, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -17,7 +18,7 @@ from filemind import __version__
 from filemind.config import AppPaths
 from filemind.embeddings import ModelError, install_model
 from filemind.library import FileAccessError, Library
-from filemind.storage import LocalStore, UnsupportedSchemaError
+from filemind.storage import LocalStore, StorageStatus, UnsupportedSchemaError
 from filemind.ui.window import MainWindow
 from filemind.windows import common_locations, set_startup
 
@@ -34,6 +35,19 @@ def _activate_existing(name: str) -> bool:
             if socket.bytesAvailable() or socket.waitForReadyRead(750):
                 return bytes(socket.readAll()) == b"ok"
     return False
+
+
+def _initialize_desktop_store(store: LocalStore) -> StorageStatus:
+    # Index repair can take time. Keep processing activation requests while SQLite opens.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(store.initialize)
+        loop = QEventLoop()
+        timer = QTimer()
+        timer.timeout.connect(lambda: loop.quit() if result.done() else None)
+        timer.start(25)
+        loop.exec()
+        timer.stop()
+        return result.result()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -86,6 +100,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         font.setFamilies(["Inter", "Microsoft YaHei UI", "Segoe UI"])
         app.setFont(font)
 
+    server = None
+    window = None
+    show_when_ready = not args.tray
+
+    def accept_connections() -> None:
+        while socket := server.nextPendingConnection():
+
+            def receive(peer: QLocalSocket = socket) -> None:
+                nonlocal show_when_ready
+                if bytes(peer.readAll()) != b"show":
+                    return
+                if window is None:
+                    show_when_ready = True
+                    available = True
+                else:
+                    available = window.reveal()
+                peer.write(b"ok" if available else b"unavailable")
+                peer.flush()
+                peer.disconnectFromServer()
+
+            socket.disconnected.connect(socket.deleteLater)
+            socket.readyRead.connect(receive)
+            QTimer.singleShot(3000, socket, socket.abort)
+            if socket.bytesAvailable():
+                receive()
+
+    def startup_error(message: str) -> int:
+        if server is not None:
+            server.close()
+        return report_startup_error(app, message)
+
     try:
         channel = (
             "filemind-"
@@ -100,8 +145,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return report_startup_error(
                     app, "无法锁定此数据目录。请检查是否已有 FileMind 窗口正在使用它。"
                 )
+        if app is not None:
+            server = QLocalServer()
+            server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+            QLocalServer.removeServer(channel)
+            server.newConnection.connect(accept_connections)
+            server.listen(channel)
         store = LocalStore(paths.database)
-        status = store.initialize()
+        status = _initialize_desktop_store(store) if app is not None else store.initialize()
         if args.add_common_locations:
             library = Library(paths, store)
             folders = common_locations()
@@ -133,37 +184,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             startup_allowed=paths.root == AppPaths.resolve().root and sys.platform == "win32",
         )
     except UnsupportedSchemaError as error:
-        return report_startup_error(app, str(error))
+        return startup_error(str(error))
     except FileAccessError as error:
-        return report_startup_error(app, str(error))
+        return startup_error(str(error))
     except (OSError, sqlite3.Error):
-        return report_startup_error(app, "无法打开本地存储。请检查数据目录和数据库文件。")
+        return startup_error("无法打开本地存储。请检查数据目录和数据库文件。")
 
-    server = QLocalServer()
-    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
-
-    def accept_connections() -> None:
-        while socket := server.nextPendingConnection():
-
-            def receive(peer: QLocalSocket = socket) -> None:
-                if bytes(peer.readAll()) != b"show":
-                    return
-                peer.write(b"ok" if window.reveal() else b"unavailable")
-                peer.flush()
-                peer.disconnectFromServer()
-
-            socket.disconnected.connect(socket.deleteLater)
-            socket.readyRead.connect(receive)
-            QTimer.singleShot(3000, socket, socket.abort)
-            if socket.bytesAvailable():
-                receive()
-
-    QLocalServer.removeServer(channel)
-    server.newConnection.connect(accept_connections)
-    server.listen(channel)
     if window.tray is not None:
         app.setQuitOnLastWindowClosed(False)
-    if not args.tray or window.tray is None:
+    if show_when_ready or window.tray is None:
         window.reveal()
     app.commitDataRequest.connect(lambda _: window.quit())
     result = app.exec()

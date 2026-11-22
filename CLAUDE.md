@@ -39,7 +39,7 @@ uv build --no-sources
 
 ### 进程与线程
 
-- `__main__.main` 解析命令行。每个数据目录只允许一个进程：用 `QLockFile`（`filemind.lock`）加锁，再用 `QLocalServer` 监听以数据目录路径哈希命名的通道。第二个实例发送 `show` 唤起已有窗口后退出。`--tray` 启动到托盘；关闭窗口只是隐藏到托盘，退出走托盘菜单。
+- `__main__.main` 解析命令行。每个数据目录只允许一个进程：用 `QLockFile`（`filemind.lock`）加锁，再用 `QLocalServer` 监听以数据目录路径哈希命名的通道。桌面启动在后台线程初始化数据库，期间暂存 `show` 请求，资料库就绪后显示窗口。运行中的第二个实例发送 `show` 后退出。`--tray` 启动到托盘；关闭窗口只是隐藏到托盘，退出走托盘菜单。
 - `ui.window.MainWindow` 创建并持有 `Library`、`Search`、`Questions` 和 `ContinuousIndex`。`Search` 和 `ContinuousIndex` 共用同一个 `SemanticIndex`（同一个 ONNX 推理会话）。
 - 交互操作通过 `MainWindow._start` 放到 `Task(QThread)` 里执行，同一时间只运行一个。操作函数接收一个 `cancelled` / `stop` 回调，耗时循环要轮询它。写操作传 `writes=True`，会进入 `ContinuousIndex.foreground()` 并持有写锁，后台索引让路。`FileAccessError` 的消息直接显示在状态栏，其他异常记日志后显示通用提示。
 - `ContinuousIndex` 有两个守护线程：索引线程处理 watchdog 事件（约 2 秒合并一批）、每 10 分钟补扫、每批 256 个文件登记；向量线程独立补建 embedding。
@@ -49,7 +49,7 @@ uv build --no-sources
 - `config.AppPaths` 定义数据目录结构：`filemind.sqlite3`、`workspace/`（受管导入副本）、`models/bge-small-zh-v1.5.onnx`。从源码运行默认使用仓库的 `data/library/`，安装版默认使用 `%LOCALAPPDATA%\FileMind`。两者都支持 `--data-dir`。`Library` 排除应用数据、Windows 系统保护目录、内置噪声目录和用户设置的排除目录。
 - `storage.LocalStore` 每次操作打开一个短连接，使用 WAL。迁移集中在 `initialize()`，按 `PRAGMA user_version` 递进（当前 `SCHEMA_VERSION = 4`）。遇到更高版本时抛出 `UnsupportedSchemaError`，且不修改数据。改表结构时要提升版本号、补迁移步骤并在 `tests/test_storage.py` 加用例。
 - 表关系：`sources`（关联目录）→ `files`（`source_id IS NULL` 表示受管导入，否则是只读关联目录下的 `relative_path`）→ `sections`（未分词的原文及位置）→ `chunks`（段内偏移、位置、jieba 词项、`model_fingerprint` 和 `vector`）。`chunks.id` 是 AUTOINCREMENT，内容更新后旧块的向量写入会被自然跳过。
-- `chunk_fts` 和 `file_catalog` 两张 FTS5 表是派生数据，启动时若缺失或存在 `fts5_dirty` 偏好会重建。`chunk_fts` 从 `chunks` 中已存的词项重建，所以修改 `text_index.keyword_terms` 只影响重新索引的文件。
+- `chunk_fts` 和 `file_catalog` 两张 FTS5 表是派生数据，启动时若缺失或存在 `fts5_dirty` 偏好会重建。独立脚本通过 `Library` 写入前先调用 `LocalStore.initialize()`，使该实例正确维护 FTS5 索引。`chunk_fts` 从 `chunks` 中已存的词项重建，所以修改 `text_index.keyword_terms` 只影响重新索引的文件。
 
 ### 索引流水线（`Library._index`）
 
