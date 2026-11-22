@@ -5,7 +5,8 @@ import json
 import os
 import re
 import stat
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -16,8 +17,8 @@ from filemind.documents import (
     MAX_FILE_BYTES,
     TEXT_EXTENSIONS,
     DocumentError,
+    DocumentParser,
     file_extension,
-    parse_document,
 )
 from filemind.file_metadata import file_metadata
 from filemind.storage import (
@@ -259,24 +260,28 @@ class Library:
         count = 0
         skipped = []
         _require_directory(self.paths.workspace)
-        for path in paths:
-            if cancelled():
-                break
-            try:
-                source, info = self._external(Path(os.path.abspath(path)))
-                _require_file(info)
-                if file_extension(source) not in EXTENSIONS:
-                    raise FileAccessError("不支持此文件格式。")
-                if info.st_size > MAX_FILE_BYTES:
-                    raise FileAccessError("导入副本限 32 MiB。可关联其目录后按文件名检索。")
-            except (OSError, FileAccessError) as error:
-                skipped.append(f"{path.name} · {_reason(error)}")
-                continue
+        with closing(DocumentParser(self.paths.temporary)) as parser:
+            for path in paths:
+                if cancelled():
+                    break
+                try:
+                    source, info = self._external(Path(os.path.abspath(path)))
+                    _require_file(info)
+                    if file_extension(source) not in EXTENSIONS:
+                        raise FileAccessError("不支持此文件格式。")
+                    if info.st_size > MAX_FILE_BYTES:
+                        raise FileAccessError("导入副本限 32 MiB。可关联其目录后按文件名检索。")
+                except (OSError, FileAccessError) as error:
+                    skipped.append(f"{path.name} · {_reason(error)}")
+                    continue
 
-            relative = Path(uuid4().hex) / source.name
-            file_id = self.store.register_file(None, relative, _key(relative), import_from=source)
-            self.retry(file_id)
-            count += 1
+                relative = Path(uuid4().hex) / source.name
+                file_id = self.store.register_file(
+                    None, relative, _key(relative), import_from=source
+                )
+                if file := self.store.file(file_id):
+                    self._index(file, parser, force=True, missing_allowed=True)
+                count += 1
         return ImportReport(count, tuple(skipped))
 
     def _complete_copy(self, file: FileRecord, destination: Path) -> None:
@@ -335,10 +340,11 @@ class Library:
 
     def refresh_managed(self, cancelled: Callable[[], bool], *, verify: bool = False) -> None:
         _require_directory(self.paths.workspace)
-        for file in self.store.source_files(None).values():
-            if cancelled():
-                return
-            self._index(file, missing_allowed=True, verify=verify)
+        with closing(DocumentParser(self.paths.temporary)) as parser:
+            for file in self.store.source_files(None).values():
+                if cancelled():
+                    return
+                self._index(file, parser, missing_allowed=True, verify=verify)
 
     def _discover(
         self,
@@ -436,15 +442,18 @@ class Library:
             self.store.update_source(
                 source.id, "indexing", f"发现 {len(found)} 个文件，正在补建内容索引。"
             )
-            for key in found:
-                if cancelled():
-                    self.store.update_source(source.id, "pending", "索引已中止，可在下次启动继续。")
-                    return
-                file = existing.get(key)
-                if file is not None and not self._index(
-                    file, missing_allowed=not warning, verify=verify
-                ):
-                    warning = "部分文件在扫描时无法访问。"
+            with closing(DocumentParser(self.paths.temporary)) as parser:
+                for key in found:
+                    if cancelled():
+                        self.store.update_source(
+                            source.id, "pending", "索引已中止，可在下次启动继续。"
+                        )
+                        return
+                    file = existing.get(key)
+                    if file is not None and not self._index(
+                        file, parser, missing_allowed=not warning, verify=verify
+                    ):
+                        warning = "部分文件在扫描时无法访问。"
         if warning:
             self.store.update_source(source.id, "failed", warning + " 已保留未确认缺失的记录。")
             return
@@ -466,42 +475,44 @@ class Library:
         except (OSError, FileAccessError):
             self.store.update_source(source.id, "failed", "关联目录暂不可访问。")
             return
-        for path in changed:
-            if cancelled():
-                return
-            if (
-                not path.is_relative_to(root)
-                or self.excluded(path, source_root=root)
-                or file_extension(path) not in EXTENSIONS
-            ):
-                continue
-            relative = path.relative_to(root)
-            key = _key(relative)
-            existing = self.store.file_at(source.id, key)
-            try:
-                info = _inspect(path)
-            except FileNotFoundError:
-                if existing and existing.status != "missing":
-                    self.store.unavailable(existing.id, "missing", "文件已移除。")
-                continue
-            except (OSError, FileAccessError):
-                continue
-            if _is_hidden(info) or not stat.S_ISREG(info.st_mode):
-                continue
-            if existing is None:
-                self.store.register_batch(source.id, {key: relative})
+        with closing(DocumentParser(self.paths.temporary)) as parser:
+            for path in changed:
+                if cancelled():
+                    return
+                if (
+                    not path.is_relative_to(root)
+                    or self.excluded(path, source_root=root)
+                    or file_extension(path) not in EXTENSIONS
+                ):
+                    continue
+                relative = path.relative_to(root)
+                key = _key(relative)
                 existing = self.store.file_at(source.id, key)
-            if existing is not None:
-                self._index(existing, missing_allowed=True, verify=True)
+                try:
+                    info = _inspect(path)
+                except FileNotFoundError:
+                    if existing and existing.status != "missing":
+                        self.store.unavailable(existing.id, "missing", "文件已移除。")
+                    continue
+                except (OSError, FileAccessError):
+                    continue
+                if _is_hidden(info) or not stat.S_ISREG(info.st_mode):
+                    continue
+                if existing is None:
+                    self.store.register_batch(source.id, {key: relative})
+                    existing = self.store.file_at(source.id, key)
+                if existing is not None:
+                    self._index(existing, parser, missing_allowed=True, verify=True)
 
-    def index_registered(self, source: Source) -> Iterator[None]:
+    def index_registered(self, source: Source) -> Generator[None]:
         warning = False
         after = 0
-        while batch := self.store.source_batch(source.id, after):
-            for file in batch:
-                warning = not self._index(file, missing_allowed=False) or warning
-                yield
-            after = batch[-1].id
+        with closing(DocumentParser(self.paths.temporary)) as parser:
+            while batch := self.store.source_batch(source.id, after):
+                for file in batch:
+                    warning = not self._index(file, parser, missing_allowed=False) or warning
+                    yield
+                after = batch[-1].id
         if source.status == "indexing":
             reason = (
                 source.reason + " 部分文件在索引时移除，等待复查。" if warning else source.reason
@@ -511,11 +522,13 @@ class Library:
     def retry(self, file_id: int) -> None:
         file = self.store.file(file_id)
         if file is not None:
-            self._index(file, force=True, missing_allowed=file.source_id is None)
+            with closing(DocumentParser(self.paths.temporary)) as parser:
+                self._index(file, parser, force=True, missing_allowed=file.source_id is None)
 
     def _index(
         self,
         file: FileRecord,
+        parser: DocumentParser,
         *,
         force: bool = False,
         missing_allowed: bool = False,
@@ -573,7 +586,13 @@ class Library:
                 self.store.update_file_stat(file.id, signature)
             return True
 
-        version = self.store.begin_index(file.id, sha, signature, parser_version=parser_version)
+        # A new file has no passages to invalidate. Its first fingerprint and text can commit together.
+        first_index = file.version == 0 and file.status == "pending" and file.sha256 is None
+        version = (
+            None
+            if first_index
+            else self.store.begin_index(file.id, sha, signature, parser_version=parser_version)
+        )
         name_terms = " ".join(keyword_terms(file.name))
         status, reason = "ready", ""
         try:
@@ -585,28 +604,31 @@ class Library:
                 elif not raw or not any(section.text.strip() for section in raw):
                     reason = "已登记文件名和路径。"
             else:
-                raw = parse_document(data, file.extension, temp_dir=self.paths.temporary)
+                raw = parser.parse(data, file.extension)
             sections = [(section, split_section(section)) for section in raw]
             sections = [(section, chunks) for section, chunks in sections if chunks]
             current = self._file_info(file, path)
             if signature != _fingerprint(current):
                 raise FileAccessError("文件在索引时发生变化，请刷新索引。")
         except DocumentError as error:
-            self.store.finish_index(
-                file.id, version, "cataloged" if metadata else "failed", str(error), "", []
-            )
-            return True
+            status, reason = ("cataloged" if metadata else "failed"), str(error)
+            sections = []
         except (OSError, FileAccessError) as error:
             self.store.unavailable(file.id, "failed", _reason(error))
             return True
 
-        if not sections and not metadata:
+        if not sections and not metadata and status == "ready":
             status, reason = (
                 ("ocr", "PDF 无可提取文本，需要 OCR。")
                 if file.extension == ".pdf"
                 else ("empty", "未提取到可索引的文本。")
             )
-        self.store.finish_index(file.id, version, status, reason, name_terms, sections)
+        if version is None:
+            self.store.finish_first_index(
+                file.id, sha, signature, parser_version, status, reason, name_terms, sections
+            )
+        else:
+            self.store.finish_index(file.id, version, status, reason, name_terms, sections)
         return True
 
     def metadata_current(self, file: FileRecord) -> bool:

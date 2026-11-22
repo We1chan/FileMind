@@ -5,9 +5,11 @@ from pathlib import Path
 import pytest
 
 from filemind.config import AppPaths
+from filemind.documents import Section
 from filemind.library import Library
 from filemind.search import Search
 from filemind.storage import SCHEMA_VERSION, LocalStore, UnsupportedSchemaError
+from filemind.text_index import TextChunk
 
 
 def test_initialization_and_preferences_survive_reopen(tmp_path: Path) -> None:
@@ -26,6 +28,33 @@ def test_initialization_and_preferences_survive_reopen(tmp_path: Path) -> None:
     reopened = LocalStore(paths.database)
     assert reopened.initialize() == status
     assert reopened.get_preference("last_page") == "search"
+
+
+def test_first_index_commits_file_and_passages_together(library: Library) -> None:
+    store = library.store
+    file_id = store.register_file(None, Path("notes.txt"), "notes.txt")
+    sections = [(Section("第 1 行", "note"), [TextChunk(0, 4, "第 1 行", "t6e6f7465")])]
+    args = (file_id, "initial", (4, 1, 1, "identity"), 0, "ready", "", "", sections)
+    with closing(sqlite3.connect(store.database_path)) as connection, connection:
+        connection.execute(
+            """CREATE TRIGGER reject_first_chunk BEFORE INSERT ON chunks
+            BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END"""
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="simulated write failure"):
+        store.finish_first_index(*args)
+
+    record = store.file(file_id)
+    assert record is not None and record.version == 0 and record.status == "pending"
+    assert store.first_passage(file_id) is None
+    with closing(sqlite3.connect(store.database_path)) as connection, connection:
+        connection.execute("DROP TRIGGER reject_first_chunk")
+    store.finish_first_index(*args)
+    passage = store.first_passage(file_id)
+    assert passage is not None and passage.file.version == 1 and passage.text == "note"
+    store.finish_first_index(*args)
+    assert store.first_passage(file_id) == passage
+    with closing(sqlite3.connect(store.database_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM sections").fetchone() == (1,)
 
 
 def test_newer_schema_is_rejected_without_changing_data(tmp_path: Path) -> None:

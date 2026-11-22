@@ -3,7 +3,7 @@
 import logging
 import os
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from itertools import islice
 from pathlib import Path
@@ -20,7 +20,7 @@ from filemind.storage import Source
 
 RECONCILE_SECONDS = 600
 EVENT_SECONDS = 2
-WORK_SECONDS = 0.2
+WORK_SECONDS = 0.025
 INDEX_BATCH = 16
 EMBEDDING_BATCHES_PER_WRITE = 4
 CPU_EMBEDDING_SCAN_SECONDS = 8
@@ -73,7 +73,7 @@ class ContinuousIndex:
         self._events = Lock()
         self._changed: dict[int, set[Path]] = defaultdict(set)
         self._trees: dict[int, float] = {}
-        self._jobs: dict[int, Iterator[None]] = {}
+        self._jobs: dict[int, Generator[None]] = {}
         self._source_roots: tuple[tuple[Path, int], ...] = ()
         self._observer = Observer(timeout=0.5)
         self._watches = {}
@@ -99,6 +99,9 @@ class ContinuousIndex:
     def stop(self) -> None:
         self.request_stop()
         self._thread.join()
+        for job in self._jobs.values():
+            job.close()
+        self._jobs.clear()
         self._vector_thread.join()
         self._observer.stop()
         self._observer.join()
@@ -210,7 +213,9 @@ class ContinuousIndex:
                 logging.getLogger(__name__).exception("Continuous indexing failed")
                 self.error = "后台索引暂时遇到错误，将自动重试。"
                 next_full = monotonic() + 15
-            wait = WORK_SECONDS if self._jobs and not self._cancelled() else EVENT_SECONDS
+            with self._events:
+                work_pending = bool(self._jobs or self._changed)
+            wait = WORK_SECONDS if work_pending and not self._cancelled() else EVENT_SECONDS
             self._wake.wait(wait)
             self._wake.clear()
 
@@ -244,7 +249,7 @@ class ContinuousIndex:
         ids = {source.id for source in sources}
         for source_id in list(self._jobs):
             if source_id not in ids:
-                del self._jobs[source_id]
+                self._jobs.pop(source_id).close()
         for source in sources:
             if self._cancelled():
                 self.refresh()
@@ -273,6 +278,9 @@ class ContinuousIndex:
                 if self._cancelled():
                     break
                 if source.id in scanned and source.status in {"indexing", "failed"}:
+                    previous = self._jobs.pop(source.id, None)
+                    if previous is not None:
+                        previous.close()
                     self._jobs[source.id] = self.library.index_registered(source)
         for source_id in trees - {source.id for source in scans}:
             if source_id in ids:

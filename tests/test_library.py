@@ -1,13 +1,49 @@
 import os
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
+from filemind.documents import DocumentError, DocumentParser
 from filemind.library import FileAccessError, Library
 from filemind.search import Search
 from filemind.storage import SearchScope
 from filemind.text_index import PASSAGE_TOKENS, bge_tokenizer
 from samples.materialize import write_pdf, write_sample
+
+
+def test_batch_parser_reuses_process_and_recovers_after_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pdf = tmp_path / "reference.pdf"
+    sheet = tmp_path / "reference.docx"
+    write_pdf(pdf, ["PDF scheduler"])
+    write_sample(sheet, "Scheduler", ["Word scheduler"])
+    with closing(DocumentParser(tmp_path / "parser")) as parser:
+        expected = parser.parse(pdf.read_bytes(), ".pdf")
+        process = parser._process
+        assert process is not None and expected[0].text.strip() == "PDF scheduler"
+
+        with pytest.raises(DocumentError):
+            parser.parse(b"invalid zip", ".docx")
+        assert any(
+            section.text == "Word scheduler"
+            for section in parser.parse(sheet.read_bytes(), ".docx")
+        )
+        assert parser._process is process
+
+        def wait_until_killed(child, _extension, _data):
+            child.wait()
+            return b""
+
+        with monkeypatch.context() as patch:
+            patch.setattr("filemind.documents.PARSE_TIMEOUT", 0.1)
+            patch.setattr(parser, "_exchange", wait_until_killed)
+            with pytest.raises(DocumentError, match="解析超过"):
+                parser.parse(pdf.read_bytes(), ".pdf")
+        assert process.poll() is not None
+        assert parser.parse(pdf.read_bytes(), ".pdf") == expected
+        assert parser._process is not process
 
 
 def test_import_keeps_same_named_copies_and_special_terms(library: Library, tmp_path: Path) -> None:

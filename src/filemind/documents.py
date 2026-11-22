@@ -4,13 +4,16 @@ import codecs
 import json
 import os
 import posixpath
+import struct
 import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from io import BytesIO
 from pathlib import Path
+from typing import BinaryIO
 from urllib.parse import unquote, urlsplit
 from xml.etree.ElementTree import Element
 from zipfile import ZipFile
@@ -39,6 +42,12 @@ MAX_XML_BYTES = 8 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_PAGES = 1_000
 OFFICE_GROUP_CHARS = 320
+PARSE_TIMEOUT = 25
+PARSER_BATCH_SIZE = 32
+MAX_RESULT_BYTES = 64 * 1024 * 1024
+_REQUEST = struct.Struct("!II")
+_LENGTH = struct.Struct("!I")
+_BATCH_EXTENSIONS = frozenset((".pdf", *WORD_EXTENSIONS, *SLIDE_EXTENSIONS, *SHEET_EXTENSIONS))
 _INVALID_UNICODE = dict.fromkeys(range(0xD800, 0xE000), "\ufffd")
 
 
@@ -59,6 +68,19 @@ def file_extension(path: Path) -> str:
     return suffixes if suffixes in ARCHIVE_EXTENSIONS else path.suffix.lower()
 
 
+def _parser_command(argument: str) -> list[str]:
+    executable = Path(sys.executable)
+    if executable.stem.lower() == "pythonw":
+        executable = executable.with_name("python.exe")
+    return [str(executable), "-m", "filemind.documents", argument]
+
+
+def _parser_environment(temp_dir: Path) -> dict[str, str]:
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    directory = str(temp_dir)
+    return dict(os.environ, TMP=directory, TEMP=directory, TMPDIR=directory)
+
+
 def parse_document(data: bytes, extension: str, *, temp_dir: Path) -> list[Section]:
     if len(data) > MAX_FILE_BYTES:
         raise DocumentError("文件超过 32 MiB。")
@@ -67,28 +89,101 @@ def parse_document(data: bytes, extension: str, *, temp_dir: Path) -> list[Secti
     if extension not in TEXT_EXTENSIONS:
         raise DocumentError("不支持此文件格式。")
 
-    executable = Path(sys.executable)
-    if executable.stem.lower() == "pythonw":
-        executable = executable.with_name("python.exe")
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    directory = str(temp_dir)
     try:
         process = subprocess.run(
-            [str(executable), "-m", "filemind.documents", extension],
+            _parser_command(extension),
             input=data,
             capture_output=True,
-            env=dict(os.environ, TMP=directory, TEMP=directory, TMPDIR=directory),
-            timeout=25,
+            env=_parser_environment(temp_dir),
+            timeout=PARSE_TIMEOUT,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except subprocess.TimeoutExpired as error:
         raise DocumentError("解析超过 25 秒。") from error
     if process.returncode:
         raise DocumentError("无法解析文件。请检查文件格式及完整性。")
-    result = json.loads(process.stdout)
+    return _decode_result(process.stdout)
+
+
+def _decode_result(payload: bytes) -> list[Section]:
+    result = json.loads(payload)
     if "error" in result:
         raise DocumentError(result["error"])
     return [Section(**item) for item in result["sections"]]
+
+
+def _read_exact(stream: BinaryIO, size: int) -> bytes:
+    data = stream.read(size)
+    if len(data) != size:
+        raise EOFError("Incomplete parser frame")
+    return data
+
+
+class DocumentParser:
+    """Reuse an isolated process for a sequence of modern Office and PDF snapshots."""
+
+    def __init__(self, temp_dir: Path) -> None:
+        self.temp_dir = temp_dir
+        self._process: subprocess.Popen[bytes] | None = None
+        self._remaining = 0
+        self._io = ThreadPoolExecutor(max_workers=1, thread_name_prefix="FileMind parser")
+
+    def parse(self, data: bytes, extension: str) -> list[Section]:
+        if extension not in _BATCH_EXTENSIONS:
+            return parse_document(data, extension, temp_dir=self.temp_dir)
+        if len(data) > MAX_FILE_BYTES:
+            raise DocumentError("文件超过 32 MiB。")
+        if self._process is None or self._remaining == 0 or self._process.poll() is not None:
+            self._stop()
+            self._process = subprocess.Popen(
+                _parser_command("--batch"),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=_parser_environment(self.temp_dir),
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            self._remaining = PARSER_BATCH_SIZE
+        self._remaining -= 1
+        reply = self._io.submit(self._exchange, self._process, extension.encode("ascii"), data)
+        try:
+            return _decode_result(reply.result(timeout=PARSE_TIMEOUT))
+        except DocumentError:
+            raise
+        except TimeoutError as error:
+            self._stop()
+            raise DocumentError(f"解析超过 {PARSE_TIMEOUT} 秒。") from error
+        except (EOFError, OSError, ValueError, TypeError, KeyError) as error:
+            self._stop()
+            raise DocumentError("无法解析文件。请检查文件格式及完整性。") from error
+
+    @staticmethod
+    def _exchange(process: subprocess.Popen[bytes], extension: bytes, data: bytes) -> bytes:
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write(_REQUEST.pack(len(extension), len(data)))
+        process.stdin.write(extension)
+        process.stdin.write(data)
+        process.stdin.flush()
+        (size,) = _LENGTH.unpack(_read_exact(process.stdout, _LENGTH.size))
+        if not 0 < size <= MAX_RESULT_BYTES:
+            raise ValueError("Invalid parser frame size")
+        return _read_exact(process.stdout, size)
+
+    def _stop(self) -> None:
+        if self._process is not None:
+            process, self._process = self._process, None
+            process.kill()
+            process.wait()
+            assert process.stdin is not None and process.stdout is not None
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+            process.stdout.close()
+
+    def close(self) -> None:
+        self._stop()
+        self._io.shutdown()
 
 
 def _text_sections(data: bytes) -> Iterator[Section]:
@@ -431,12 +526,10 @@ def _legacy_office_sections(data: bytes, extension: str) -> Iterator[tuple[int, 
             del reader
 
 
-def _parser_main() -> None:
+def _parse_result(data: bytes, extension: str) -> dict:
     try:
-        data = sys.stdin.buffer.read(MAX_FILE_BYTES + 1)
         if len(data) > MAX_FILE_BYTES:
             raise DocumentError("文件超过 32 MiB。")
-        extension = sys.argv[1]
         if extension == ".pdf":
             sections = _pdf_sections(data)
         elif extension in SHEET_EXTENSIONS:
@@ -455,7 +548,41 @@ def _parser_main() -> None:
         result = {"error": str(error)}
     except Exception:
         result = {"error": "无法解析文件。请检查文件格式及完整性。"}
-    sys.stdout.buffer.write(json.dumps(result, ensure_ascii=True).encode("ascii"))
+    return result
+
+
+def _serve_batch(source: BinaryIO, sink: BinaryIO) -> None:
+    encoder = json.JSONEncoder(ensure_ascii=True, separators=(",", ":"))
+    for _ in range(PARSER_BATCH_SIZE):
+        header = source.read(_REQUEST.size)
+        if not header:
+            return
+        extension_size, data_size = _REQUEST.unpack(header)
+        if not 1 <= extension_size <= 8 or data_size > MAX_FILE_BYTES:
+            raise ValueError("Invalid parser request")
+        extension = _read_exact(source, extension_size).decode("ascii")
+        if extension not in _BATCH_EXTENSIONS:
+            raise ValueError("Invalid parser extension")
+        data = _read_exact(source, data_size)
+        result = bytearray()
+        for part in encoder.iterencode(_parse_result(data, extension)):
+            result.extend(part.encode("ascii"))
+            if len(result) > MAX_RESULT_BYTES:
+                result = json.dumps({"error": "解析结果超过 64 MiB。"}).encode("ascii")
+                break
+        sink.write(_LENGTH.pack(len(result)))
+        sink.write(result)
+        sink.flush()
+        del data, result
+
+
+def _parser_main() -> None:
+    source, sink = sys.stdin.buffer, sys.stdout.buffer
+    if sys.argv[1] == "--batch":
+        _serve_batch(source, sink)
+    else:
+        data = source.read(MAX_FILE_BYTES + 1)
+        sink.write(json.dumps(_parse_result(data, sys.argv[1]), ensure_ascii=True).encode("ascii"))
 
 
 if __name__ == "__main__":

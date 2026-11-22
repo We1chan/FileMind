@@ -592,6 +592,27 @@ class LocalStore:
                 (sha256, sha256, parser_version, sha256, parser_version, *fingerprint, file_id),
             ).fetchone()[0]
 
+    def finish_first_index(
+        self,
+        file_id: int,
+        sha256: str | None,
+        fingerprint: tuple[int, int, int, str],
+        parser_version: int,
+        status: str,
+        reason: str,
+        name_terms: str,
+        sections: list[tuple[Section, list[TextChunk]]],
+    ) -> None:
+        with self._session(catalog_change=True) as connection:
+            updated = connection.execute(
+                """UPDATE files SET version = 1, sha256 = ?, parser_version = ?, size = ?,
+                modified_ns = ?, changed_ns = ?, identity = ?, status = ?, reason = ?
+                WHERE id = ? AND version = 0 AND status = 'pending' AND sha256 IS NULL""",
+                (sha256, parser_version, *fingerprint, status, reason, file_id),
+            )
+            if updated.rowcount:
+                self._write_sections(connection, file_id, name_terms, sections)
+
     def finish_index(
         self,
         file_id: int,
@@ -606,31 +627,41 @@ class LocalStore:
                 "UPDATE files SET status = ?, reason = ? WHERE id = ? AND version = ? AND status = 'pending'",
                 (status, reason, file_id, version),
             )
-            if not updated.rowcount:
-                return
-            for section, chunks in sections:
-                section_id = connection.execute(
-                    "INSERT INTO sections(file_id, location, text, heading) VALUES (?, ?, ?, ?)",
-                    (file_id, section.location, section.text, section.heading),
+            if updated.rowcount:
+                self._write_sections(connection, file_id, name_terms, sections)
+
+    def _write_sections(
+        self,
+        connection: sqlite3.Connection,
+        file_id: int,
+        name_terms: str,
+        sections: list[tuple[Section, list[TextChunk]]],
+    ) -> None:
+        if sections and not self.fts5_available:
+            connection.execute("INSERT OR IGNORE INTO preferences VALUES ('fts5_dirty', '1')")
+        for section, chunks in sections:
+            section_id = connection.execute(
+                "INSERT INTO sections(file_id, location, text, heading) VALUES (?, ?, ?, ?)",
+                (file_id, section.location, section.text, section.heading),
+            ).lastrowid
+            for chunk in chunks:
+                chunk_id = connection.execute(
+                    """INSERT INTO chunks(section_id, start, end, location, name_terms, body_terms)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        section_id,
+                        chunk.start,
+                        chunk.end,
+                        chunk.location,
+                        name_terms,
+                        chunk.terms,
+                    ),
                 ).lastrowid
-                for chunk in chunks:
-                    chunk_id = connection.execute(
-                        """INSERT INTO chunks(section_id, start, end, location, name_terms, body_terms)
-                        VALUES (?, ?, ?, ?, ?, ?)""",
-                        (
-                            section_id,
-                            chunk.start,
-                            chunk.end,
-                            chunk.location,
-                            name_terms,
-                            chunk.terms,
-                        ),
-                    ).lastrowid
-                    if self.fts5_available:
-                        connection.execute(
-                            "INSERT INTO chunk_fts(rowid, name_terms, body_terms) VALUES (?, ?, ?)",
-                            (chunk_id, name_terms, chunk.terms),
-                        )
+                if self.fts5_available:
+                    connection.execute(
+                        "INSERT INTO chunk_fts(rowid, name_terms, body_terms) VALUES (?, ?, ?)",
+                        (chunk_id, name_terms, chunk.terms),
+                    )
 
     @staticmethod
     def _has_vectors(
