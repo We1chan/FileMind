@@ -1,10 +1,15 @@
 """桌面工作区的配色、字体层级和应用图标。"""
 
-from math import cos, pi, sin
-
 from PySide6.QtCore import QLineF, QRect, QRectF, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
-from PySide6.QtWidgets import QComboBox, QStyle, QStyleOptionComboBox, QStylePainter
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtWidgets import (
+    QComboBox,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionComboBox,
+    QStyleOptionViewItem,
+    QStylePainter,
+)
 
 WINDOW_STYLE = """
 QWidget#Shell { background: #f7f5f1; color: #1c3026; }
@@ -12,21 +17,11 @@ QFrame#Sidebar { background: #153728; }
 QLabel#Brand { color: #fbfbf2; font-family: Georgia; font-size: 26px; font-weight: 600; }
 QListWidget#Navigation {
     background: #153728;
-    color: #f5f7ef;
+    color: #d4e1d8;
     border: none;
+    font-family: "Microsoft YaHei UI";
+    font-size: 15px;
 }
-QListWidget#Navigation::item {
-    padding-left: 18px;
-    border: 1px solid transparent;
-    border-radius: 8px;
-}
-QListWidget#Navigation::item:hover { background: #294f3c; }
-QListWidget#Navigation::item:selected {
-    background: #3d694b;
-    color: #ffffff;
-    border-color: #437051;
-}
-QListWidget#Navigation::item:selected:focus { border-color: #74c8b9; }
 QLabel#PageTitle { color: #133b2c; font-family: "SimSun"; font-size: 34px; font-weight: 700; }
 QLabel#Hint { color: #566459; }
 QFrame#Card {
@@ -77,7 +72,6 @@ QComboBox::drop-down {
 QListWidget[results="true"]::item { padding: 7px 6px; border-bottom: 1px solid #eef2f6; }
 QListWidget[results="true"]::item:hover { background: #eaf4f2; }
 QListWidget[results="true"]::item:selected { background: #dce9d5; color: #123c36; }
-QListWidget#Navigation { font-family: SimSun; font-size: 18px; }
 QWidget#SearchWorkspace, QFrame#SearchHeader, QFrame#SearchDetail {
     background: #f7f5f1;
 }
@@ -227,13 +221,10 @@ def line_icon(name: str, color: str = "#151b17") -> QIcon:
         stroke((2, 12), (12, 17.2), (22, 12))
         stroke((2, 16.5), (12, 21.7), (22, 16.5))
     elif name == "settings":
-        points = []
-        for index in range(32):
-            angle = index * pi / 16
-            radius = 10.4 if index % 4 in (1, 2) else 8.3
-            points.append((12 + radius * cos(angle), 12 + radius * sin(angle)))
-        stroke(*points, points[0])
-        painter.drawEllipse(QRectF(8.5, 8.5, 7, 7))
+        for y, knob in ((6, 9), (12, 15), (18, 11)):
+            stroke((3, y), (knob - 2.2, y))
+            stroke((knob + 2.2, y), (21, y))
+            painter.drawEllipse(QRectF(knob - 2.2, y - 2.2, 4.4, 4.4))
     elif name == "book":
         stroke(
             (12, 6),
@@ -280,6 +271,55 @@ def line_icon(name: str, color: str = "#151b17") -> QIcon:
     painter.drawPath(path)
     painter.end()
     return QIcon(pixmap)
+
+
+class NavigationDelegate(QStyledItemDelegate):
+    """Paint the sidebar rows while keeping native list selection and navigation."""
+
+    def paint(self, painter, option, index):
+        row = QStyleOptionViewItem(option)
+        self.initStyleOption(row, index)
+        selected = bool(row.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(row.state & QStyle.StateFlag.State_MouseOver)
+        keyboard_focus = (
+            row.state & QStyle.StateFlag.State_HasFocus
+            and row.widget is not None
+            and row.widget.window().testAttribute(Qt.WidgetAttribute.WA_KeyboardFocusChange)
+        )
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bounds = QRectF(row.rect).adjusted(0.5, 0.5, -0.5, -0.5)
+        if selected or hovered:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#2c553f" if selected else "#234632"))
+            painter.drawRoundedRect(bounds, 7, 7)
+        if selected:
+            painter.setBrush(QColor("#b5d6ad"))
+            marker = QRectF(bounds.left() + 4, bounds.center().y() - 8, 2.5, 16)
+            painter.drawRoundedRect(marker, 1.25, 1.25)
+        if keyboard_focus:
+            painter.setPen(QPen(QColor("#b5d6ad"), 1, Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(bounds.adjusted(1.5, 1.5, -1.5, -1.5), 6, 6)
+
+        icon_size = row.decorationSize
+        icon_x = row.rect.left() + 17
+        icon_y = row.rect.top() + (row.rect.height() - icon_size.height()) // 2
+        row.icon.paint(painter, QRect(icon_x, icon_y, icon_size.width(), icon_size.height()))
+        font = QFont(row.font)
+        if selected:
+            font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(font)
+        painter.setPen(QColor("#f5f8f1" if selected else "#d4e1d8"))
+        label_rect = row.rect.adjusted(48, 0, -12, 0)
+        text = QFontMetrics(font).elidedText(
+            row.text, Qt.TextElideMode.ElideRight, label_rect.width()
+        )
+        painter.drawText(
+            label_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text
+        )
+        painter.restore()
 
 
 class ChevronComboBox(QComboBox):

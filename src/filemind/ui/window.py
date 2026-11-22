@@ -58,7 +58,7 @@ from filemind.ui.pages import (
     label,
 )
 from filemind.ui.pdf_reader import PdfReader
-from filemind.ui.theme import WINDOW_STYLE, application_icon, line_icon
+from filemind.ui.theme import WINDOW_STYLE, NavigationDelegate, application_icon, line_icon
 from filemind.windows import (
     common_locations,
     expanded_caption_hit,
@@ -198,9 +198,11 @@ class MainWindow(QMainWindow):
         self.navigation = QListWidget()
         self.navigation.setObjectName("Navigation")
         self.navigation.setAccessibleName("主导航")
-        self.navigation.setSpacing(2)
+        self.navigation.setSpacing(3)
+        self.navigation.setItemDelegate(NavigationDelegate(self.navigation))
+        self.navigation.setMouseTracking(True)
         self.navigation.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.navigation.setIconSize(QSize(23, 23))
+        self.navigation.setIconSize(QSize(20, 20))
         self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self.pages = QStackedWidget()
@@ -221,8 +223,8 @@ class MainWindow(QMainWindow):
                 "organize": "layers",
                 "settings": "settings",
             }
-            item.setIcon(line_icon(symbol[page.key], "#f5f7ef"))
-            item.setSizeHint(QSize(0, 48))
+            item.setIcon(line_icon(symbol[page.key], "#c6d9ce"))
+            item.setSizeHint(QSize(0, 42))
             self.navigation.addItem(item)
             self.pages.addWidget(self._make_page(page, body))
 
@@ -387,11 +389,11 @@ class MainWindow(QMainWindow):
         sidebar.setObjectName("Sidebar")
         sidebar.setFixedWidth(178)
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(8, 22, 8, 0)
+        layout.setContentsMargins(12, 22, 12, 0)
         layout.setSpacing(28)
 
         brand = QVBoxLayout()
-        brand.setContentsMargins(18, 0, 0, 0)
+        brand.setContentsMargins(14, 0, 0, 0)
         brand.setSpacing(0)
         icon = QLabel()
         icon.setPixmap(self.windowIcon().pixmap(QSize(46, 46), self.devicePixelRatioF()))
