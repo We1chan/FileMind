@@ -4,6 +4,7 @@ import ctypes
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from uuid import UUID
 
@@ -12,39 +13,160 @@ from filemind.config import AppPaths
 _RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _VALUE = "FileMind"
 
-_DWMWA_CAPTION_COLOR = 35
-_DWMWA_TEXT_COLOR = 36
-_DWMWA_COLOR_DEFAULT = 0xFFFFFFFF
+CAPTION_BUTTON_WIDTH = 45
+CAPTION_HEIGHT = 32
 
 
-def set_title_bar_colors(hwnd: int, colors: tuple[str, str] | None) -> None:
-    """Set native caption and text colors from #RRGGBB, or restore system colors."""
-    if os.name != "nt" or sys.getwindowsversion().build < 22000:
-        return
+_WM_NCMOUSELEAVE = 0x02A2
+_TME_LEAVE_NONCLIENT = 0x12
 
-    from ctypes import wintypes
 
-    set_attribute = ctypes.WinDLL("dwmapi.dll", winmode=0x800).DwmSetWindowAttribute
-    set_attribute.argtypes = (
-        wintypes.HWND,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-        wintypes.DWORD,
+class _MouseTracking(ctypes.Structure):
+    _fields_ = (
+        ("size", ctypes.c_uint),
+        ("flags", ctypes.c_uint),
+        ("hwnd", ctypes.c_void_p),
+        ("hover_time", ctypes.c_uint),
     )
-    set_attribute.restype = ctypes.c_long
 
-    def set_color(attribute: int, value: int) -> bool:
-        color = wintypes.DWORD(value)
-        return set_attribute(hwnd, attribute, ctypes.byref(color), ctypes.sizeof(color)) >= 0
 
-    if colors is None:
-        set_color(_DWMWA_CAPTION_COLOR, _DWMWA_COLOR_DEFAULT)
-        set_color(_DWMWA_TEXT_COLOR, _DWMWA_COLOR_DEFAULT)
-        return
+class IntegratedCaption:
+    """Extend the client top while keeping the Win32 window styles and commands."""
 
-    caption, text = (int.from_bytes(bytes.fromhex(color[1:]), "little") for color in colors)
-    if set_color(_DWMWA_CAPTION_COLOR, caption) and not set_color(_DWMWA_TEXT_COLOR, text):
-        set_color(_DWMWA_CAPTION_COLOR, _DWMWA_COLOR_DEFAULT)
+    def __init__(self, scale: Callable[[], float], hover: Callable[[int | None], None]) -> None:
+        from ctypes import wintypes
+
+        import win32con
+        import win32gui
+
+        self.enabled = False
+        self._scale = scale
+        self._hover = hover
+        self._hot = None
+        self._pressed = None
+        self._types = wintypes
+        self._win = win32con
+        self._gui = win32gui
+        self._buttons = (win32con.HTMINBUTTON, win32con.HTMAXBUTTON, win32con.HTCLOSE)
+        user = ctypes.WinDLL("user32.dll", winmode=0x800)
+        self._dpi = user.GetDpiForWindow
+        self._dpi.argtypes = (wintypes.HWND,)
+        self._dpi.restype = wintypes.UINT
+        self._metrics = user.GetSystemMetricsForDpi
+        self._metrics.argtypes = (ctypes.c_int, wintypes.UINT)
+        self._metrics.restype = ctypes.c_int
+        self._maximized = user.IsZoomed
+        self._maximized.argtypes = (wintypes.HWND,)
+        self._maximized.restype = wintypes.BOOL
+        self._default_proc = user.DefWindowProcW
+        self._default_proc.argtypes = (
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
+        self._default_proc.restype = ctypes.c_ssize_t
+        self._track_mouse = user.TrackMouseEvent
+        self._track_mouse.argtypes = (ctypes.POINTER(_MouseTracking),)
+        self._track_mouse.restype = wintypes.BOOL
+
+    def set_enabled(self, hwnd: int, enabled: bool) -> None:
+        if self.enabled == enabled:
+            return
+        self.enabled = enabled
+        if not enabled:
+            self._pressed = None
+            self._set_hover(hwnd, None)
+        win = self._win
+        self._gui.SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            0,
+            0,
+            win.SWP_NOMOVE
+            | win.SWP_NOSIZE
+            | win.SWP_NOZORDER
+            | win.SWP_NOACTIVATE
+            | win.SWP_FRAMECHANGED,
+        )
+
+    def handle_message(self, address: int) -> int | None:
+        if not self.enabled:
+            return None
+        win = self._win
+        event = self._types.MSG.from_address(address)
+        if event.message == win.WM_NCCALCSIZE and event.wParam:
+            area = self._types.RECT.from_address(event.lParam)
+            top = area.top
+            self._default_proc(event.hWnd, event.message, event.wParam, event.lParam)
+            # Preserve the side/bottom frame and the invisible maximized resize inset.
+            area.top = top + (self._top_border(event.hWnd) if self._maximized(event.hWnd) else 0)
+            return 0
+        if event.message == win.WM_NCHITTEST:
+            return self._hit_test(event.hWnd, event.lParam)
+        button = event.wParam
+        if event.message == win.WM_NCMOUSEMOVE:
+            hot = self._buttons.index(button) if button in self._buttons else None
+            self._set_hover(event.hWnd, hot)
+        elif event.message == _WM_NCMOUSELEAVE:
+            self._pressed = None
+            self._set_hover(event.hWnd, None)
+        elif event.message in (win.WM_NCLBUTTONDOWN, win.WM_NCLBUTTONDBLCLK):
+            if button in self._buttons:
+                self._pressed = button
+                return 0
+        elif event.message == win.WM_NCLBUTTONUP:
+            pressed, self._pressed = self._pressed, None
+            if button in self._buttons:
+                if pressed == button:
+                    self._post_button_command(event.hWnd, button)
+                return 0
+        elif event.message in (win.WM_LBUTTONUP, win.WM_CANCELMODE):
+            self._pressed = None
+        return None
+
+    def _post_button_command(self, hwnd: int, button: int) -> None:
+        win = self._win
+        maximize = win.SC_RESTORE if self._maximized(hwnd) else win.SC_MAXIMIZE
+        command = {
+            win.HTMINBUTTON: win.SC_MINIMIZE,
+            win.HTMAXBUTTON: maximize,
+            win.HTCLOSE: win.SC_CLOSE,
+        }
+        self._gui.PostMessage(hwnd, win.WM_SYSCOMMAND, command[button], 0)
+
+    def _set_hover(self, hwnd: int, hot: int | None) -> None:
+        if hot == self._hot:
+            return
+        self._hot = hot
+        if hot is not None:
+            tracking = _MouseTracking(ctypes.sizeof(_MouseTracking), _TME_LEAVE_NONCLIENT, hwnd, 0)
+            self._track_mouse(ctypes.byref(tracking))
+        self._hover(hot)
+
+    def _top_border(self, hwnd: int) -> int:
+        dpi = self._dpi(hwnd)
+        return self._metrics(33, dpi) + self._metrics(92, dpi)  # Vertical frame and padded border.
+
+    def _hit_test(self, hwnd: int, coordinates: int) -> int | None:
+        left, top = self._gui.ClientToScreen(hwnd, (0, 0))
+        width = self._gui.GetClientRect(hwnd)[2]
+        scale = self._scale()
+        x = ctypes.c_short(coordinates & 0xFFFF).value - left
+        y = ctypes.c_short((coordinates >> 16) & 0xFFFF).value - top
+        if not (0 <= x < width and 0 <= y < round(CAPTION_HEIGHT * scale)):
+            return None
+
+        win = self._win
+        if not self._maximized(hwnd) and y < self._top_border(hwnd):
+            return win.HTTOP
+        from_right = width - 1 - x
+        for index, hit in enumerate((win.HTCLOSE, win.HTMAXBUTTON, win.HTMINBUTTON), 1):
+            if from_right < round(index * CAPTION_BUTTON_WIDTH * scale):
+                return hit
+        return win.HTCAPTION
 
 
 def _known_folder(identifier: str) -> Path | None:

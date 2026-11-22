@@ -10,14 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl
+from PySide6.QtCore import QEvent, QSize, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import (
     QCloseEvent,
     QDesktopServices,
-    QFont,
-    QIcon,
-    QPainter,
-    QPixmap,
     QShowEvent,
     QTextCursor,
 )
@@ -27,6 +23,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -38,11 +35,11 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QSystemTrayIcon,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from filemind import __version__
 from filemind.config import AppPaths
 from filemind.continuous import ContinuousIndex
 from filemind.documents import EXTENSIONS
@@ -53,6 +50,7 @@ from filemind.search import MAX_QUERY_CHARS, Search
 from filemind.storage import FileRecord, LocalStore, Passage, Source, StorageStatus
 from filemind.ui.organize_page import OrganizePage
 from filemind.ui.pages import (
+    PAGE_COUNT_ROLE,
     PAGE_SIZE,
     ROLE,
     STATUS,
@@ -64,12 +62,14 @@ from filemind.ui.pages import (
     label,
 )
 from filemind.ui.pdf_reader import PdfReader
-from filemind.ui.theme import TITLE_BAR_COLORS, WINDOW_STYLE, application_icon
+from filemind.ui.theme import WINDOW_STYLE, NavigationDelegate, application_icon, line_icon
 from filemind.ui.tray import TrayMenu, tray_icon
 from filemind.windows import (
+    CAPTION_BUTTON_WIDTH,
+    CAPTION_HEIGHT,
+    IntegratedCaption,
     common_locations,
     set_startup,
-    set_title_bar_colors,
     starts_with_windows,
 )
 
@@ -173,25 +173,36 @@ class MainWindow(QMainWindow):
         self._shutdown_task: Task | None = None
         self.closing = False
         self.offset = 0
+        self._search_split = [414, 586]
+        self._frame = None
+        self._caption_buttons = None
         self.setWindowTitle("FileMind")
         self.setWindowIcon(application_icon())
         self.setMinimumSize(920, 580)
-        self.resize(1280, 780)
         self.setStyleSheet(WINDOW_STYLE)
+        self.statusBar().messageChanged.connect(
+            lambda message: self.statusBar().setVisible(bool(message))
+        )
+        self.statusBar().hide()
         # Keep the PySide wrapper alive with its accessibility hints child.
         self._style_hints = (
             QApplication.styleHints() if QApplication.platformName() == "windows" else None
         )
         if self._style_hints is not None:
+            self._frame = IntegratedCaption(self.devicePixelRatioF, self._set_caption_hover)
             self._style_hints.accessibility().contrastPreferenceChanged.connect(
                 self._update_title_bar
             )
+        self.resize(1268, 794)
 
         self.navigation = QListWidget()
         self.navigation.setObjectName("Navigation")
         self.navigation.setAccessibleName("主导航")
         self.navigation.setSpacing(3)
-        self.navigation.setIconSize(QSize(23, 23))
+        self.navigation.setItemDelegate(NavigationDelegate(self.navigation))
+        self.navigation.setMouseTracking(True)
+        self.navigation.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.navigation.setIconSize(QSize(20, 20))
         self.navigation.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self.pages = QStackedWidget()
@@ -207,21 +218,14 @@ class MainWindow(QMainWindow):
         bodies = (self.library_page, self.search_page, self.organize_page, self.settings_page)
         for page, body in zip(PAGES, bodies, strict=True):
             item = QListWidgetItem(page.title)
-            symbols = {
-                "library": "\ue8b7",
-                "search": "\ue721",
-                "organize": "\ue81e",
-                "settings": "\ue713",
+            symbol = {
+                "library": "folder",
+                "search": "search",
+                "organize": "layers",
+                "settings": "settings",
             }
-            mark = QPixmap(24, 24)
-            mark.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(mark)
-            painter.setPen(Qt.GlobalColor.white)
-            painter.setFont(QFont("Segoe MDL2 Assets", 13))
-            painter.drawText(mark.rect(), Qt.AlignmentFlag.AlignCenter, symbols[page.key])
-            painter.end()
-            item.setIcon(QIcon(mark))
-            item.setSizeHint(QSize(0, 43))
+            item.setIcon(line_icon(symbol[page.key], "#c6d9ce"))
+            item.setSizeHint(QSize(0, 42))
             self.navigation.addItem(item)
             self.pages.addWidget(self._make_page(page, body))
 
@@ -258,11 +262,74 @@ class MainWindow(QMainWindow):
 
     def _update_title_bar(self, contrast: Qt.ContrastPreference) -> None:
         high_contrast = contrast == Qt.ContrastPreference.HighContrast
-        if self.isVisible() and (handle := self.windowHandle()) is not None:
-            colors = None if high_contrast else TITLE_BAR_COLORS
-            set_title_bar_colors(int(handle.winId()), colors)
+        if self.isVisible() and self._frame is not None and self._caption_buttons is not None:
+            self._frame.set_enabled(int(self.winId()), not high_contrast)
+            self._caption_buttons.setVisible(not high_contrast)
         if self.tray is not None and isinstance(menu := self.tray.contextMenu(), TrayMenu):
             menu.set_high_contrast(high_contrast)
+
+    def nativeEvent(self, event_type, message):
+        if self._frame is not None and event_type == b"windows_generic_MSG":
+            result = self._frame.handle_message(int(message))
+            if result is not None:
+                return True, result
+        return super().nativeEvent(event_type, message)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and self._caption_buttons is not None:
+            self._sync_maximize_button()
+
+    def _set_caption_hover(self, index: int | None) -> None:
+        if self._caption_buttons is None:
+            return
+        for position, control in enumerate(self._caption_controls):
+            hovered = position == index
+            if bool(control.property("captionHover")) != hovered:
+                control.setProperty("captionHover", hovered)
+                control.style().unpolish(control)
+                control.style().polish(control)
+                control.update()
+
+    def _toggle_maximized(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def _sync_maximize_button(self) -> None:
+        maximized = self.isMaximized()
+        self._maximize_button.setIcon(
+            line_icon("caption_restore" if maximized else "caption_maximize")
+        )
+        name = "向下还原" if maximized else "最大化"
+        self._maximize_button.setAccessibleName(name)
+        self._maximize_button.setToolTip(name)
+
+    def _make_caption_buttons(self) -> QWidget:
+        controls = QWidget()
+        row = QHBoxLayout(controls)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        self._caption_controls = []
+        for icon, name, action in (
+            ("caption_minimize", "最小化", self.showMinimized),
+            ("caption_maximize", "最大化", self._toggle_maximized),
+            ("caption_close", "关闭", self.close),
+        ):
+            control = QToolButton()
+            control.setObjectName("CaptionClose" if icon == "caption_close" else "CaptionButton")
+            control.setAccessibleName(name)
+            control.setToolTip(name)
+            control.setIcon(line_icon(icon))
+            control.setIconSize(QSize(14, 14))
+            control.setFixedSize(CAPTION_BUTTON_WIDTH, CAPTION_HEIGHT)
+            control.clicked.connect(action)
+            row.addWidget(control)
+            self._caption_controls.append(control)
+            if icon == "caption_maximize":
+                self._maximize_button = control
+        return controls
 
     def _setup_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -337,7 +404,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._make_sidebar())
 
         work_area = QWidget()
-        content = QHBoxLayout(work_area)
+        content = self.work_layout = QHBoxLayout(work_area)
         content.setContentsMargins(24, 24, 22, 24)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -349,19 +416,29 @@ class MainWindow(QMainWindow):
         self.detail_panel = detail
         detail.setObjectName("Card")
         detail.setMinimumWidth(218)
-        detail_layout = QVBoxLayout(detail)
+        detail_layout = self.detail_layout = QVBoxLayout(detail)
         detail_layout.setContentsMargins(18, 20, 18, 20)
         detail_layout.setSpacing(10)
         detail_layout.addWidget(self.detail_title)
         detail_layout.addWidget(self.detail_hint)
         self.pdf = PdfReader()
         self.pdf.render_failed.connect(self._pdf_failed)
+        self.pdf.page_count_found.connect(self._show_pdf_page_count)
         detail_layout.addWidget(self.pdf, 1)
         detail_layout.addWidget(self.preview, 1)
         detail_layout.addWidget(self.organize_page.details, 1)
+        self.detail_placeholder = QWidget()
+        detail_layout.addWidget(self.detail_placeholder, 1)
         self.ask_file = button("基于此文件提问", "AskFile")
+        self.ask_file.setIcon(line_icon("bubble", "#194331"))
+        self.ask_file.setIconSize(QSize(23, 23))
         self.ask_file.clicked.connect(self._ask_file)
-        detail_layout.addWidget(self.ask_file, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.ask_footer = QFrame()
+        self.ask_footer.setObjectName("AskFooter")
+        footer = QHBoxLayout(self.ask_footer)
+        footer.setContentsMargins(12, 10, 12, 13)
+        footer.addWidget(self.ask_file, alignment=Qt.AlignmentFlag.AlignHCenter)
+        detail_layout.addWidget(self.ask_footer)
         detail_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         splitter.addWidget(detail)
         splitter.setStretchFactor(0, 2)
@@ -369,36 +446,50 @@ class MainWindow(QMainWindow):
         splitter.setSizes([590, 295])
         content.addWidget(splitter)
 
-        layout.addWidget(work_area, 1)
+        if self._frame is not None:
+            surface = QWidget()
+            overlay = QGridLayout(surface)
+            overlay.setContentsMargins(0, 0, 0, 0)
+            overlay.addWidget(work_area, 0, 0)
+            self._caption_buttons = self._make_caption_buttons()
+            self._caption_buttons.hide()
+            overlay.addWidget(
+                self._caption_buttons, 0, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight
+            )
+            layout.addWidget(surface, 1)
+        else:
+            layout.addWidget(work_area, 1)
         return shell
 
     def _make_sidebar(self) -> QFrame:
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(174)
+        sidebar.setFixedWidth(178)
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(15, 24, 15, 18)
-        layout.setSpacing(21)
+        layout.setContentsMargins(12, 22, 12, 0)
+        layout.setSpacing(28)
 
         brand = QVBoxLayout()
-        brand.setSpacing(9)
+        brand.setContentsMargins(14, 0, 0, 0)
+        brand.setSpacing(0)
         icon = QLabel()
-        icon.setPixmap(self.windowIcon().pixmap(31, 31))
-        brand.addWidget(icon, alignment=Qt.AlignmentFlag.AlignHCenter)
-        brand.addWidget(label("FileMind", "Brand"), alignment=Qt.AlignmentFlag.AlignHCenter)
+        icon.setPixmap(self.windowIcon().pixmap(QSize(46, 46), self.devicePixelRatioF()))
+        icon.setContentsMargins(15, 0, 0, 0)
+        brand.addWidget(icon, alignment=Qt.AlignmentFlag.AlignLeft)
+        brand.addWidget(label("FileMind", "Brand"))
         layout.addLayout(brand)
         layout.addWidget(self.navigation, 1)
-        layout.addWidget(label(f"版本 {__version__}", "Version"))
         return sidebar
 
     def _make_page(self, page: Page, body: QWidget) -> QWidget:
+        if page.key == "search":
+            return body
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 1, 0, 0)
         layout.setSpacing(7)
         layout.addWidget(label(page.title, "PageTitle"))
-        if page.key != "search":
-            layout.addWidget(label(page.description, "Hint", wrap=True))
+        layout.addWidget(label(page.description, "Hint", wrap=True))
         layout.addSpacing(10)
         layout.addWidget(body, 1)
         return widget
@@ -407,12 +498,29 @@ class MainWindow(QMainWindow):
         page = PAGES[index]
         searching = page.key == "search"
         target = self.search_page.splitter if searching else self.workspace_splitter
-        if self.detail_panel.parentWidget() is not target:
+        previous = self.detail_panel.parentWidget()
+        if previous is not target:
+            if previous is self.search_page.splitter:
+                self._search_split = previous.sizes()
             target.addWidget(self.detail_panel)
-            target.setSizes([450, 560] if searching else [650, 300])
-        self.ask_file.setVisible(searching)
+        self.work_layout.setContentsMargins(*((0, 0, 0, 0) if searching else (24, 31, 22, 24)))
+        self.detail_panel.setObjectName("SearchDetail" if searching else "Card")
+        self.detail_panel.style().unpolish(self.detail_panel)
+        self.detail_panel.style().polish(self.detail_panel)
+        self.detail_layout.setContentsMargins(*((0, 0, 0, 0) if searching else (18, 20, 18, 20)))
+        self.detail_layout.setSpacing(0 if searching else 10)
+        self.detail_title.setContentsMargins(*((20, 10, 16, 5) if searching else (0, 0, 0, 0)))
+        self.detail_hint.setContentsMargins(*((20, 2, 18, 8) if searching else (0, 0, 0, 0)))
+        self.ask_footer.setVisible(searching)
         self.ask_file.setEnabled(self._result_file() is not None)
         self.pages.setCurrentIndex(index)
+        if searching:
+            target.setStretchFactor(0, 1)
+            target.setStretchFactor(1, 1)
+            if previous is not target:
+                QTimer.singleShot(0, target, self._size_search_split)
+        else:
+            target.setSizes([650, 300])
         self._reset_detail()
         if page.key == "library":
             self._file_detail()
@@ -424,6 +532,16 @@ class MainWindow(QMainWindow):
             self._task_detail()
             self.settings_page.model_status.setText(self.search.semantic.status)
 
+    def _size_search_split(self) -> None:
+        splitter = self.search_page.splitter
+        if splitter.count() == 2:
+            left, right = self._search_split
+            width = splitter.width() - splitter.handleWidth()
+            left_width = (
+                round(width * left / (left + right)) if left + right else width * 414 // 1000
+            )
+            splitter.setSizes([left_width, width - left_width])
+
     def _reset_detail(self) -> None:
         page = PAGES[self.pages.currentIndex()]
         self.detail_title.setText(page.detail_title)
@@ -431,6 +549,7 @@ class MainWindow(QMainWindow):
         self.pdf.reset()
         self.detail_hint.show()
         self.detail_title.show()
+        self.detail_placeholder.setVisible(page.key == "search")
         self.preview.clear()
         self.preview.hide()
         self.organize_page.details.hide()
@@ -466,9 +585,9 @@ class MainWindow(QMainWindow):
         search = self.search_page
         search.find_button.clicked.connect(lambda: self._search(False))
         search.query.returnPressed.connect(lambda: self._search(False))
-        search.ask_button.clicked.connect(lambda: self._search(True))
+        search.ask_action.triggered.connect(lambda: self._search(True))
         search.scope_button.clicked.connect(lambda: search.choose_scope(self.store))
-        search.locate_button.clicked.connect(lambda: self._locate(self._result_file()))
+        search.locate_action.triggered.connect(lambda: self._locate(self._result_file()))
         search.results.currentItemChanged.connect(
             lambda current, _: self.ask_file.setEnabled(current is not None)
         )
@@ -653,6 +772,7 @@ class MainWindow(QMainWindow):
                 self._shutdown_task.start()
             event.ignore()
             return
+        self.pdf.reset()
         super().closeEvent(event)
         if self.tray is not None:
             QApplication.quit()
@@ -666,6 +786,7 @@ class MainWindow(QMainWindow):
         self.close()
 
     def shutdown(self) -> None:
+        self.pdf.reset()
         self.closing = True
         self._filter_delay.stop()
         if self.catalog_task is not None:
@@ -1139,6 +1260,7 @@ class MainWindow(QMainWindow):
         self.detail_hint.setText(
             f"{passage.file.name}\n{passage.location} · {file_origin(passage.file)}"
         )
+        self.detail_placeholder.hide()
         self.preview.setPlainText(passage.section_text)
         offset = passage.text.find(quote) if quote else -1
         start = passage.start + offset if offset >= 0 else passage.start
@@ -1168,6 +1290,12 @@ class MainWindow(QMainWindow):
                 self.detail_hint.hide()
                 self.pdf.setToolTip(passage.file.name)
                 self.preview.hide()
+
+    def _show_pdf_page_count(self, count: int) -> None:
+        if self.pages.currentWidget() is self.search_page:
+            item = self.search_page.results.currentItem()
+            if item is not None:
+                item.setData(PAGE_COUNT_ROLE, count)
 
     def _pdf_failed(self):
         self.pdf.reset()

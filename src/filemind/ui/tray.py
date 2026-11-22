@@ -4,7 +4,7 @@ from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QMenu, QVBoxLayout, QWidget, QWidgetAction
 
-from filemind.ui.theme import TITLE_BAR_COLORS, application_icon
+from filemind.ui.theme import application_icon
 
 _MENU_STYLE = """
 QMenu#FileMindTray {
@@ -50,7 +50,7 @@ def tray_icon() -> QIcon:
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         painter.scale(size / 32, size / 32)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(TITLE_BAR_COLORS[0]))
+        painter.setBrush(QColor("#133b2c"))
         painter.drawRoundedRect(QRectF(0.5, 0.5, 31, 31), 7, 7)
         painter.drawPixmap(QRectF(3, 3, 29, 29), source, QRectF(source.rect()))
         painter.end()

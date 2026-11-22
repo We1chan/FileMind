@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 
 from filemind.config import AppPaths
 from filemind.storage import LocalStore
+from filemind.ui.pages import PAGE_COUNT_ROLE
 from filemind.ui.tray import TrayMenu
 from filemind.ui.window import MainWindow
 
@@ -214,7 +215,8 @@ def test_desktop_organization_flow(
         window.search_page.query.setText("FIRST/FOLLOW")
         click(window.search_page.find_button)
         assert window.search_page.results.count() == 1
-        click(window.search_page.ask_button)
+        window.search_page.ask_action.trigger()
+        wait_for_task(window)
         assert "原文摘录" in window.search_page.note.text()
         results = window.search_page.results
         citation = results.item(0)
@@ -286,7 +288,7 @@ def test_desktop_organization_flow(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows startup visibility")
-def test_tray_activation_shows_the_native_window_after_hidden_launch(tmp_path: Path) -> None:
+def test_tray_activation_restores_native_window_controls(tmp_path: Path) -> None:
     startup = subprocess.STARTUPINFO()
     startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = subprocess.SW_HIDE
@@ -294,9 +296,11 @@ def test_tray_activation_shows_the_native_window_after_hidden_launch(tmp_path: P
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
-from win32gui import IsWindowVisible
+import win32api
+import win32con
+import win32gui
 
 from filemind.config import AppPaths
 from filemind.storage import LocalStore
@@ -311,7 +315,46 @@ try:
     assert not window.isVisible()
     window._tray_activated(QSystemTrayIcon.ActivationReason.Trigger)
     app.processEvents()
-    assert IsWindowVisible(int(window.winId())), "FileMind window is hidden at the Win32 level"
+    hwnd = int(window.winId())
+    assert win32gui.IsWindowVisible(hwnd), "FileMind window is hidden at the Win32 level"
+    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+    assert style & win32con.WS_CAPTION == win32con.WS_CAPTION
+
+    integrated = app.styleHints().accessibility().contrastPreference() != Qt.ContrastPreference.HighContrast
+    assert window._caption_buttons.isVisible() == integrated
+
+    def assert_caption_targets():
+        left, top, right, _ = win32gui.GetWindowRect(hwnd)
+        _, client_y = win32gui.ClientToScreen(hwnd, (0, 0))
+        scale = window.devicePixelRatioF()
+        caption_y = client_y + round(16 * scale) if integrated else (top + client_y) // 2
+        position = win32api.MAKELONG((left + right) // 2, caption_y)
+        assert win32gui.SendMessage(hwnd, win32con.WM_NCHITTEST, 0, position) == win32con.HTCAPTION
+        if integrated:
+            expected = (win32con.HTMINBUTTON, win32con.HTMAXBUTTON, win32con.HTCLOSE)
+            for control, hit in zip(window._caption_controls, expected, strict=True):
+                assert win32gui.SendMessage(hwnd, win32con.WM_NCHITTEST, 0, button_pos(control)) == hit
+
+    def button_pos(control):
+        x, y = win32gui.ClientToScreen(hwnd, (0, 0))
+        scale = window.devicePixelRatioF()
+        point = control.mapTo(window, control.rect().center())
+        return win32api.MAKELONG(x + round(point.x() * scale), y + round(point.y() * scale))
+
+    assert_caption_targets()
+    for _ in range(5):
+        for target_state in (True, False):
+            if integrated:
+                hit = win32con.HTMAXBUTTON
+                position = button_pos(window._maximize_button)
+                win32gui.SendMessage(hwnd, win32con.WM_NCLBUTTONDOWN, hit, position)
+                win32gui.SendMessage(hwnd, win32con.WM_NCLBUTTONUP, hit, position)
+            else:
+                command = win32con.SC_MAXIMIZE if target_state else win32con.SC_RESTORE
+                win32gui.SendMessage(hwnd, win32con.WM_SYSCOMMAND, command, 0)
+            app.processEvents()
+            assert window.isMaximized() == target_state
+            assert_caption_targets()
 finally:
     window.close()
     window.deleteLater()
@@ -424,7 +467,7 @@ def test_desktop_import_search_and_open_citation(
         assert window.search_page.results.count() == 1
         assert "语义检索未启用" in window.search_page.note.text()
 
-        QTest.mouseClick(window.search_page.ask_button, Qt.MouseButton.LeftButton)
+        window.search_page.ask_action.trigger()
         wait_for_task(window)
         assert "原文摘录" in window.search_page.note.text()
         assert not requests
@@ -433,7 +476,7 @@ def test_desktop_import_search_and_open_citation(
         assert window.settings_page.remote.isEnabled()
         window.settings_page.remote.click()
         click_navigation(window, 1)
-        QTest.mouseClick(window.search_page.ask_button, Qt.MouseButton.LeftButton)
+        window.search_page.ask_action.trigger()
         wait_for_task(window)
         assert requests == [("mock", "FIRST/FOLLOW")]
         assert window.search_page.answer.isVisible()
@@ -494,6 +537,7 @@ def test_pdf_result_opens_physical_page_and_reader_controls(app: QApplication, t
         renderer = reader.process
         assert reader.isVisible()
         assert reader.page.count() == 2
+        assert page.results.currentItem().data(PAGE_COUNT_ROLE) == 2
         assert reader.page.currentIndex() == 1
         assert not reader.next.isEnabled()
         reader.previous.click()
@@ -513,6 +557,17 @@ def test_pdf_result_opens_physical_page_and_reader_controls(app: QApplication, t
         assert reader.dialog is None and reader.view.parentWidget() == reader
         window.navigation.setCurrentRow(0)
         assert reader.page.count() == 0
+        assert reader.process is None
+        window.navigation.setCurrentRow(1)
+        wait_for_task(window)
+        wait_for_page()
+        assert reader.process is not None
+        window.close()
+        for _ in range(200):
+            if not window.isVisible():
+                break
+            QTest.qWait(20)
+        assert not window.isVisible()
         assert reader.process is None
     finally:
         close_window(window)
