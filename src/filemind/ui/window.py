@@ -14,6 +14,7 @@ from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import (
     QCloseEvent,
     QDesktopServices,
+    QShowEvent,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -61,7 +62,6 @@ from filemind.ui.pdf_reader import PdfReader
 from filemind.ui.theme import WINDOW_STYLE, NavigationDelegate, application_icon, line_icon
 from filemind.windows import (
     common_locations,
-    expanded_caption_hit,
     set_startup,
     set_title_bar_colors,
     starts_with_windows,
@@ -171,7 +171,6 @@ class MainWindow(QMainWindow):
         self.closing = False
         self.offset = 0
         self._search_split = [414, 586]
-        self._expanded_caption = False
         self.setWindowTitle("FileMind")
         self.setWindowIcon(application_icon())
         self.setMinimumSize(920, 580)
@@ -185,14 +184,9 @@ class MainWindow(QMainWindow):
             QApplication.styleHints() if QApplication.platformName() == "windows" else None
         )
         if self._style_hints is not None:
-            accessibility = self._style_hints.accessibility()
-            if (
-                accessibility.contrastPreference() != Qt.ContrastPreference.HighContrast
-                and self._style_hints.colorScheme() != Qt.ColorScheme.Dark
-            ):
-                self._configure_caption()
-            else:
-                accessibility.contrastPreferenceChanged.connect(self._update_title_bar)
+            self._style_hints.accessibility().contrastPreferenceChanged.connect(
+                self._update_title_bar
+            )
         self.resize(1268, 794)
 
         self.navigation = QListWidget()
@@ -252,32 +246,15 @@ class MainWindow(QMainWindow):
             self._updates.timeout.connect(self._background_status)
             self._updates.start()
 
-    def _configure_caption(self) -> None:
-        self._expanded_caption = True
-        self.setAttribute(Qt.WidgetAttribute.WA_ContentsMarginsRespectsSafeArea, False)
-        self.setWindowFlags(
-            self.windowFlags()
-            | Qt.WindowType.ExpandedClientAreaHint
-            | Qt.WindowType.NoTitleBarBackgroundHint
-        )
-        self.winId()
-        handle = self.windowHandle()
-        # QWidget adds a title hint when it has caption buttons. Suppress the
-        # duplicate icon and title on the underlying QWindow, keeping the buttons.
-        flags = int(handle.flags()) | int(Qt.WindowType.CustomizeWindowHint)
-        handle.setFlags(Qt.WindowType(flags & ~int(Qt.WindowType.WindowTitleHint)))
-
-    def nativeEvent(self, event_type, message):
-        if self._expanded_caption and event_type == b"windows_generic_MSG":
-            hit = expanded_caption_hit(int(message), maximized=self.isMaximized())
-            if hit is not None:
-                return True, hit
-        return super().nativeEvent(event_type, message)
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        if self._style_hints is not None:
+            self._update_title_bar(self._style_hints.accessibility().contrastPreference())
 
     def _update_title_bar(self, contrast: Qt.ContrastPreference) -> None:
         if self.isVisible() and (handle := self.windowHandle()) is not None:
             colors = (
-                None if contrast == Qt.ContrastPreference.HighContrast else ("#f5f3ee", "#111714")
+                None if contrast == Qt.ContrastPreference.HighContrast else ("#f7f5f1", "#153728")
             )
             set_title_bar_colors(int(handle.winId()), colors)
 

@@ -165,7 +165,7 @@ def test_library_filter_discards_a_slow_obsolete_query(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows startup visibility")
-def test_tray_activation_shows_the_native_window_after_hidden_launch(tmp_path: Path) -> None:
+def test_tray_activation_restores_native_window_controls(tmp_path: Path) -> None:
     startup = subprocess.STARTUPINFO()
     startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startup.wShowWindow = subprocess.SW_HIDE
@@ -175,7 +175,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
-from win32gui import IsWindowVisible
+import win32api
+import win32con
+import win32gui
 
 from filemind.config import AppPaths
 from filemind.storage import LocalStore
@@ -190,7 +192,29 @@ try:
     assert not window.isVisible()
     window._tray_activated(QSystemTrayIcon.ActivationReason.Trigger)
     app.processEvents()
-    assert IsWindowVisible(int(window.winId())), "FileMind window is hidden at the Win32 level"
+    hwnd = int(window.winId())
+    assert win32gui.IsWindowVisible(hwnd), "FileMind window is hidden at the Win32 level"
+    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+    assert style & win32con.WS_CAPTION == win32con.WS_CAPTION
+
+    left, top, right, _ = win32gui.GetWindowRect(hwnd)
+    _, client_top = win32gui.ClientToScreen(hwnd, (0, 0))
+    caption_y = (top + client_top) // 2
+    position = win32api.MAKELONG((left + right) // 2, caption_y)
+    assert win32gui.SendMessage(hwnd, win32con.WM_NCHITTEST, 0, position) == win32con.HTCAPTION
+    hits = {
+        win32gui.SendMessage(hwnd, win32con.WM_NCHITTEST, 0, win32api.MAKELONG(x, caption_y))
+        for x in range(right - (right - left) // 2, right, 3)
+    }
+    assert {win32con.HTMINBUTTON, win32con.HTMAXBUTTON, win32con.HTCLOSE} <= hits
+
+    for _ in range(5):
+        win32gui.SendMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_MAXIMIZE, 0)
+        app.processEvents()
+        assert window.isMaximized()
+        win32gui.SendMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_RESTORE, 0)
+        app.processEvents()
+        assert not window.isMaximized()
 finally:
     window.close()
     window.deleteLater()
